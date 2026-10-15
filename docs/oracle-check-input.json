@@ -1,0 +1,11 @@
+{
+  "action": "oracle.request",
+  "input": {
+    "question": "On pricecharting.com, on the product page for \"Charizard #4\" in \"Pokemon Base Set\" (URL starting https://www.pricecharting.com/game/pokemon-base-set/charizard-4), what is the price shown in the \"PSA 10\" column at the time of reading within the pinned window?",
+    "chainId": 1,
+    "answerType": "uint256",
+    "evidence": "panel",
+    "panelSize": 30,
+    "toleranceBps": 500
+  }
+}

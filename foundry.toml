@@ -1,0 +1,18 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+bytecode_hash = "none"
+
+[profile.default.fuzz]
+runs = 256
+seed = "0xa99e62958597bb59a9e282d986a3db72f02d663f4b0c643629d7eba2336756d3"
+
+[fmt]
+line_length = 120

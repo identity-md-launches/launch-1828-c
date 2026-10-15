@@ -1,0 +1,28 @@
+{
+  "v": 1,
+  "question": "On pricecharting.com, on the product page for \"Charizard #4\" in \"Pokemon Base Set\" (URL starting https://www.pricecharting.com/game/pokemon-base-set/charizard-4), what is the price shown in the \"PSA 10\" column at the time of reading within the pinned window?",
+  "chainId": 1,
+  "window": {
+    "hours": 24
+  },
+  "answerType": "uint256",
+  "evidence": "panel",
+  "panelSize": 30,
+  "quorum": 21,
+  "toleranceBps": 500,
+  "validForSeconds": 86400,
+  "definitions": {
+    "term": "The single number displayed in the named grade column on the specified product page. Do not substitute an auction sale, an ungraded price, or another grade. If unavailable, report inability, not zero.",
+    "period": "Value when read within the pinned block window.",
+    "unit": "US dollars.",
+    "rounding": "Whole dollars rounded down."
+  },
+  "guards": {
+    "sources": [
+      "https://www.pricecharting.com/game/pokemon-base-set/charizard-4"
+    ],
+    "minSources": 1,
+    "min": "0",
+    "max": "1000000000000"
+  }
+}

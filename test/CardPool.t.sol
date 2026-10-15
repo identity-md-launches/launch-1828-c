@@ -178,6 +178,27 @@ contract CardPoolTest is Fixture {
         pool.redeem(1, lender, lender);
     }
 
+    function test_maxRedeemNeverAdvertisesDustThatRedeemRefuses() public {
+        vm.prank(lender);
+        pool.transfer(bob, 100_000);
+        assertEq(pool.previewRedeem(100_000), 0);
+        assertEq(pool.maxRedeem(bob), 0);
+        vm.expectRevert(CardPool.InvalidAmount.selector);
+        vm.prank(bob);
+        pool.redeem(100_000, bob, bob);
+        vm.prank(lender);
+        pool.transfer(bob, 1e6);
+        uint256 maximum = pool.maxRedeem(bob);
+        assertGt(maximum, 0);
+        vm.prank(bob);
+        assertGt(pool.redeem(maximum, bob, bob), 0);
+        borrow(450e6);
+        maximum = pool.maxRedeem(lender);
+        assertEq(pool.previewRedeem(maximum), pool.maxWithdraw(lender));
+        vm.prank(lender);
+        pool.redeem(maximum, lender, lender);
+    }
+
     function testFuzz_depositRedeemCannotCreateAssets(uint96 amountSeed, uint96 donationSeed) public {
         uint256 amount = bound(uint256(amountSeed), 1, 10000e6);
         uint256 donation = bound(uint256(donationSeed), 0, 10000e6);

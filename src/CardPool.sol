@@ -49,8 +49,11 @@ contract CardPool is ERC4626, Guarded, ReentrancyGuard {
         return IERC20(asset()).balanceOf(address(this)) - reserve;
     }
 
+    /// @notice Unreserved cash, receivables marked down the Dutch curve, and the reserve expected to cover shortfalls.
     function totalAssets() public view override returns (uint256) {
-        return availableLiquidity() + (lending == address(0) ? 0 : ICardDebt(lending).totalDebt());
+        if (lending == address(0)) return availableLiquidity();
+        (uint256 receivable, uint256 expectedShortfall) = ICardDebt(lending).netReceivable();
+        return availableLiquidity() + receivable + Math.min(reserve, expectedShortfall);
     }
 
     function _decimalsOffset() internal pure override returns (uint8) {
@@ -65,8 +68,10 @@ contract CardPool is ERC4626, Guarded, ReentrancyGuard {
         return Math.min(super.maxWithdraw(holder), availableLiquidity());
     }
 
+    /// @dev Never advertises a dust amount that `redeem` would refuse.
     function maxRedeem(address holder) public view override returns (uint256) {
-        return Math.min(balanceOf(holder), convertToShares(availableLiquidity()));
+        uint256 shares = Math.min(balanceOf(holder), convertToShares(availableLiquidity()));
+        return previewRedeem(shares) == 0 ? 0 : shares;
     }
 
     function maxDeposit(address) public view override returns (uint256) {

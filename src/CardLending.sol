@@ -34,12 +34,30 @@ contract CardLending is Guarded, ReentrancyGuard {
         uint256 auctionDebt;
     }
 
+    /// @dev Memory projection of the auction book at a point in time; see `_projectBook`.
+    struct Book {
+        uint256 parHead;
+        uint256 descentHead;
+        uint256 floorHead;
+        uint256 parDebt;
+        uint256 descentDebt;
+        uint256 descentWeight;
+        uint256 floorMark;
+    }
+
     uint256 public constant BPS = 10_000;
     uint256 public constant MAX_LTV_BPS = 4500;
     uint256 public constant LIQUIDATION_LTV_BPS = 6000;
     uint256 public constant ORIGINATION_FEE_BPS = 100;
     uint256 public constant TERM = 30 days;
     uint256 public constant AUCTION_DURATION = 1 days;
+    uint256 public constant AUCTION_START_BPS = 12_000;
+    uint256 public constant AUCTION_FLOOR_BPS = 5_000;
+    /// @notice Seconds after an auction opens during which its price is still at or above the debt.
+    uint256 public constant PAR_WINDOW =
+        (AUCTION_START_BPS - BPS) * AUCTION_DURATION / (AUCTION_START_BPS - AUCTION_FLOOR_BPS);
+    /// @notice An auction unsold for this long after reaching its floor is carried at zero in pool NAV.
+    uint256 public constant WRITE_OFF_DELAY = 1 days;
     uint256 public constant INTEREST_DENOMINATOR = BPS * 365 days;
     uint16 public aprBps = 1200;
     MockCardNFT public immutable nft;
@@ -59,6 +77,17 @@ contract CardLending is Guarded, ReentrancyGuard {
     uint256 public frozenDebt;
     uint256 public lastAccrual;
 
+    // Auction book: ids in liquidation order, so every phase change happens in queue order and the
+    // aggregates below can be brought up to date lazily by walking from three heads.
+    uint256[] public auctionQueue;
+    uint256 public parHead;
+    uint256 public descentHead;
+    uint256 public floorHead;
+    uint256 public parDebt;
+    uint256 public descentDebt;
+    uint256 public descentWeight;
+    uint256 public floorMark;
+
     error InvalidAmount();
     error NotBorrower();
     error WrongState();
@@ -67,6 +96,7 @@ contract CardLending is Guarded, ReentrancyGuard {
     error NotLiquidatable();
     error Slippage();
     error InvalidRate();
+    error RateAboveLimit();
     error DependenciesMismatch();
 
     event Borrowed(
@@ -131,10 +161,11 @@ contract CardLending is Guarded, ReentrancyGuard {
         return loans[id];
     }
 
+    /// @notice Interest owed so far, rounded up to a base unit so rounding never favours the borrower.
     function interestOf(uint256 id) public view returns (uint256) {
         Loan storage l = loans[id];
         if (l.state != State.Active) return 0;
-        return _loanInterestNumerator(l) / INTEREST_DENOMINATOR;
+        return Math.ceilDiv(_loanInterestNumerator(l), INTEREST_DENOMINATOR);
     }
 
     function debtOf(uint256 id) public view returns (uint256) {
@@ -144,9 +175,27 @@ contract CardLending is Guarded, ReentrancyGuard {
         return 0;
     }
 
+    /// @notice Contractual debt of every open loan: active principal and interest plus frozen auction debt.
     function totalDebt() external view returns (uint256) {
-        return activePrincipal + frozenDebt + (interestNumerator + rateWeight * (block.timestamp - lastAccrual))
-            / INTEREST_DENOMINATOR;
+        return activePrincipal + frozenDebt + _accruedInterest();
+    }
+
+    /// @notice What the pool carries as receivable, and how much of the frozen debt it expects to lose.
+    /// @dev Auction loans are marked at min(debt, current Dutch price): par for the first `PAR_WINDOW`,
+    /// then down the curve to 50%, and at zero once unsold for `WRITE_OFF_DELAY` past the floor.
+    function netReceivable() external view returns (uint256 receivable, uint256 expectedShortfall) {
+        uint256 mark = _auctionMark(_projectBook(block.timestamp), block.timestamp);
+        receivable = activePrincipal + _accruedInterest() + mark;
+        expectedShortfall = frozenDebt - mark;
+    }
+
+    /// @notice Current NAV mark of one auction loan; zero once written off or when no auction is open.
+    function auctionMark(uint256 id) external view returns (uint256) {
+        Loan storage l = loans[id];
+        if (l.state != State.Auction) return 0;
+        uint256 elapsed = block.timestamp - l.auctionStartedAt;
+        if (elapsed >= AUCTION_DURATION + WRITE_OFF_DELAY) return 0;
+        return Math.min(l.auctionDebt, auctionPrice(id));
     }
 
     /// @notice Anyone may repay in full, including while paused or at auction; the NFT always returns to its borrower.
@@ -156,7 +205,7 @@ contract CardLending is Guarded, ReentrancyGuard {
         uint256 debt = debtOf(id);
         _accrue();
         if (l.state == State.Active) _removeActive(l);
-        else frozenDebt -= debt;
+        else _removeAuction(l);
         l.state = State.Closed;
         delete collateralLoan[l.tokenId];
         _payPool(msg.sender, debt, debt);
@@ -166,14 +215,17 @@ contract CardLending is Guarded, ReentrancyGuard {
     }
 
     /// @notice Pay accrued interest and renew for 30 days at the current owner-set APR. No additional origination fee.
-    function extend(uint256 id) external nonReentrant whenNotPaused {
+    /// @param maxAprBps Highest APR the borrower accepts for the new term; protects against a rate change landing first.
+    function extend(uint256 id, uint16 maxAprBps) external nonReentrant whenNotPaused {
         Loan storage l = loans[id];
         if (l.state != State.Active || block.timestamp >= l.maturity) revert WrongState();
         if (msg.sender != l.borrower) revert NotBorrower();
+        if (aprBps > maxAprBps) revert RateAboveLimit();
         CardOracle.Price memory p = oracle.freshPrice(l.classId);
         if (p.issuedAt <= l.priceIssuedAt) revert PriceNotNewer();
+        // Interest is paid in this call, so the debt that survives the renewal is the principal alone.
+        if (l.principal > Math.mulDiv(p.price, MAX_LTV_BPS, BPS)) revert TooMuchDebt();
         uint256 interest = interestOf(id);
-        if (l.principal + interest > Math.mulDiv(p.price, MAX_LTV_BPS, BPS)) revert TooMuchDebt();
         _accrue();
         interestNumerator -= _loanInterestNumerator(l);
         rateWeight -= l.principal * l.aprBps;
@@ -197,8 +249,11 @@ contract CardLending is Guarded, ReentrancyGuard {
             if (debt <= Math.mulDiv(p.price, LIQUIDATION_LTV_BPS, BPS)) revert NotLiquidatable();
         }
         _accrue();
+        _syncAuctions();
         _removeActive(l);
         frozenDebt += debt;
+        parDebt += debt;
+        auctionQueue.push(id);
         l.state = State.Auction;
         l.auctionStartedAt = uint64(block.timestamp);
         l.auctionDebt = debt;
@@ -210,7 +265,7 @@ contract CardLending is Guarded, ReentrancyGuard {
         Loan storage l = loans[id];
         if (l.state != State.Auction) revert WrongState();
         uint256 elapsed = Math.min(block.timestamp - l.auctionStartedAt, AUCTION_DURATION);
-        uint256 numerator = 12_000 * AUCTION_DURATION - 7_000 * elapsed;
+        uint256 numerator = AUCTION_START_BPS * AUCTION_DURATION - (AUCTION_START_BPS - AUCTION_FLOOR_BPS) * elapsed;
         return Math.mulDiv(l.auctionDebt, numerator, BPS * AUCTION_DURATION, Math.Rounding.Ceil);
     }
 
@@ -220,8 +275,8 @@ contract CardLending is Guarded, ReentrancyGuard {
         if (price > maxPrice) revert Slippage();
         Loan storage l = loans[id];
         uint256 debt = l.auctionDebt;
+        _removeAuction(l);
         l.state = State.Closed;
-        frozenDebt -= debt;
         delete collateralLoan[l.tokenId];
         uint256 paidToPool = Math.min(price, debt);
         uint256 extra = price - paidToPool;
@@ -247,6 +302,15 @@ contract CardLending is Guarded, ReentrancyGuard {
         emit SurplusClaimed(msg.sender, receiver, amount);
     }
 
+    /// @notice Permissionless: records auction phase changes so later NAV reads walk fewer entries.
+    function syncAuctions() external {
+        _syncAuctions();
+    }
+
+    function auctionQueueLength() external view returns (uint256) {
+        return auctionQueue.length;
+    }
+
     function setAPR(uint16 next) external onlyOwner {
         if (next > BPS) revert InvalidRate();
         aprBps = next;
@@ -265,6 +329,11 @@ contract CardLending is Guarded, ReentrancyGuard {
         lastAccrual = block.timestamp;
     }
 
+    /// @dev Rounded up like each loan's own interest, so NAV never exceeds what settlement collects.
+    function _accruedInterest() private view returns (uint256) {
+        return Math.ceilDiv(interestNumerator + rateWeight * (block.timestamp - lastAccrual), INTEREST_DENOMINATOR);
+    }
+
     function _loanInterestNumerator(Loan storage l) private view returns (uint256) {
         return l.principal * l.aprBps * (block.timestamp - l.startedAt);
     }
@@ -273,5 +342,76 @@ contract CardLending is Guarded, ReentrancyGuard {
         activePrincipal -= l.principal;
         interestNumerator -= _loanInterestNumerator(l);
         rateWeight -= l.principal * l.aprBps;
+    }
+
+    /// @dev Drops an auction from the book at its current phase. The caller sets the state afterwards.
+    function _removeAuction(Loan storage l) private {
+        _syncAuctions();
+        uint256 debt = l.auctionDebt;
+        uint256 elapsed = block.timestamp - l.auctionStartedAt;
+        if (elapsed <= PAR_WINDOW) {
+            parDebt -= debt;
+        } else if (elapsed < AUCTION_DURATION) {
+            descentDebt -= debt;
+            descentWeight -= debt * l.auctionStartedAt;
+        } else if (elapsed < AUCTION_DURATION + WRITE_OFF_DELAY) {
+            floorMark -= Math.ceilDiv(debt, 2);
+        }
+        frozenDebt -= debt;
+    }
+
+    function _syncAuctions() private {
+        Book memory b = _projectBook(block.timestamp);
+        parHead = b.parHead;
+        descentHead = b.descentHead;
+        floorHead = b.floorHead;
+        parDebt = b.parDebt;
+        descentDebt = b.descentDebt;
+        descentWeight = b.descentWeight;
+        floorMark = b.floorMark;
+    }
+
+    /// @dev Advances each head over the entries whose phase ended by `t`. Closed entries are skipped: they were
+    /// removed from the aggregates at the phase they were in when they closed, after a sync at that time.
+    function _projectBook(uint256 t) private view returns (Book memory b) {
+        b = Book(parHead, descentHead, floorHead, parDebt, descentDebt, descentWeight, floorMark);
+        uint256 length = auctionQueue.length;
+        while (b.parHead < length) {
+            Loan storage l = loans[auctionQueue[b.parHead]];
+            if (t - l.auctionStartedAt <= PAR_WINDOW) break;
+            if (l.state == State.Auction) {
+                b.parDebt -= l.auctionDebt;
+                b.descentDebt += l.auctionDebt;
+                b.descentWeight += l.auctionDebt * l.auctionStartedAt;
+            }
+            ++b.parHead;
+        }
+        while (b.descentHead < length) {
+            Loan storage l = loans[auctionQueue[b.descentHead]];
+            if (t - l.auctionStartedAt < AUCTION_DURATION) break;
+            if (l.state == State.Auction) {
+                b.descentDebt -= l.auctionDebt;
+                b.descentWeight -= l.auctionDebt * l.auctionStartedAt;
+                b.floorMark += Math.ceilDiv(l.auctionDebt, 2);
+            }
+            ++b.descentHead;
+        }
+        while (b.floorHead < length) {
+            Loan storage l = loans[auctionQueue[b.floorHead]];
+            if (t - l.auctionStartedAt < AUCTION_DURATION + WRITE_OFF_DELAY) break;
+            if (l.state == State.Auction) b.floorMark -= Math.ceilDiv(l.auctionDebt, 2);
+            ++b.floorHead;
+        }
+    }
+
+    /// @dev Sum of min(debt, price) over open auctions at `t`, within one base unit per descending auction.
+    function _auctionMark(Book memory b, uint256 t) private pure returns (uint256 mark) {
+        mark = b.parDebt + b.floorMark;
+        if (b.descentDebt != 0) {
+            uint256 elapsedWeight = t * b.descentDebt - b.descentWeight;
+            uint256 numerator = AUCTION_START_BPS * AUCTION_DURATION * b.descentDebt
+                - (AUCTION_START_BPS - AUCTION_FLOOR_BPS) * elapsedWeight;
+            mark += Math.ceilDiv(numerator, BPS * AUCTION_DURATION);
+        }
     }
 }

@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Fixture} from "./helpers/Fixture.sol";
 import {CardLending} from "../src/CardLending.sol";
 import {CardOracle} from "../src/CardOracle.sol";
+import {OracleAttestation} from "../src/OracleAttestation.sol";
 import {CardPool} from "../src/CardPool.sol";
 import {MockCardNFT} from "../src/MockCardNFT.sol";
 import {Pausable} from "@openzeppelin/contracts/utils/Pausable.sol";
@@ -100,9 +101,9 @@ contract CardLendingTest is Fixture {
         uint256 id = borrow(400e6);
         lending.setAPR(5000);
         vm.warp(block.timestamp + 15 days);
-        assertEq(lending.interestOf(id), uint256(400e6) * 1200 * 15 days / (10_000 * 365 days));
+        assertEq(lending.interestOf(id), Math.ceilDiv(uint256(400e6) * 1200 * 15 days, 10_000 * 365 days));
         vm.warp(block.timestamp + 30 days);
-        assertEq(lending.interestOf(id), uint256(400e6) * 1200 * 45 days / (10_000 * 365 days));
+        assertEq(lending.interestOf(id), Math.ceilDiv(uint256(400e6) * 1200 * 45 days, 10_000 * 365 days));
         assertEq(getLoan(id).aprBps, 1200);
         assertEq(pool.totalAssets(), 10_000e6 + lending.interestOf(id));
     }
@@ -149,7 +150,7 @@ contract CardLendingTest is Fixture {
         uint256 id = borrow(400e6);
         vm.expectRevert(CardLending.PriceNotNewer.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         vm.warp(block.timestamp + 10 days);
         deliverPrice(1000);
         lending.setAPR(1500);
@@ -157,7 +158,7 @@ contract CardLendingTest is Fixture {
         uint256 balance = usdc.balanceOf(alice);
         uint256 nav = pool.totalAssets();
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         CardLending.Loan memory l = getLoan(id);
         assertEq(l.maturity, block.timestamp + 30 days);
         assertEq(l.startedAt, block.timestamp);
@@ -173,16 +174,16 @@ contract CardLendingTest is Fixture {
         uint256 id = borrow(400e6);
         vm.expectRevert(CardLending.NotBorrower.selector);
         vm.prank(bob);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         vm.warp(block.timestamp + 1 days);
         deliverPrice(800);
         vm.expectRevert(CardLending.TooMuchDebt.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         vm.warp(getLoan(id).maturity);
         vm.expectRevert(CardLending.WrongState.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
     }
 
     function test_extendCannotReuseSameAttestation() public {
@@ -190,10 +191,10 @@ contract CardLendingTest is Fixture {
         vm.warp(block.timestamp + 10);
         deliverPrice(1000);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         vm.expectRevert(CardLending.PriceNotNewer.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
     }
 
     function test_liquidationAtMaturityWithoutFreshOracle() public {
@@ -215,7 +216,7 @@ contract CardLendingTest is Fixture {
         lending.liquidate(id);
         vm.expectRevert(CardLending.WrongState.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
     }
 
     function test_priceLiquidationNeedsStrictlyNewerAttestationAndOver60Percent() public {
@@ -233,12 +234,224 @@ contract CardLendingTest is Fixture {
         assertEq(getLoan(id).auctionDebt, 300e6);
     }
 
-    function test_zeroNewPriceAllowsLiquidation() public {
-        uint256 id = borrow(300e6);
+    function test_zeroAnswerIsNotAPriceAndCannotLiquidateHealthyLoan() public {
+        uint256 id = borrow(450e6);
         vm.warp(block.timestamp + 1);
-        deliverPrice(0);
+        bytes32 request = ask();
+        OracleAttestation.Attestation memory a = attestation(0);
+        (bool ok, bytes memory data) = intake.deliver(request, a, sign(a));
+        assertFalse(ok);
+        assertEq(bytes4(data), CardOracle.BadAttestation.selector);
+        assertEq(oracle.freshPrice(cardClass).price, 1000e6);
+        vm.expectRevert(CardLending.PriceNotNewer.selector);
         lending.liquidate(id);
-        assertEq(uint256(getLoan(id).state), uint256(CardLending.State.Auction));
+        assertEq(uint256(getLoan(id).state), uint256(CardLending.State.Active));
+        assertEq(nft.ownerOf(tokenId), address(lending));
+        vm.expectRevert(CardLending.WrongState.selector);
+        vm.prank(bob);
+        lending.buy(id, 540e6, bob);
+    }
+
+    function test_tinyPrincipalStillOwesRoundedUpInterest() public {
+        uint256 id = borrow(100);
+        vm.warp(block.timestamp + 30 days);
+        assertEq(lending.interestOf(id), 1);
+        assertEq(lending.debtOf(id), 101);
+        uint256 balance = usdc.balanceOf(alice);
+        vm.prank(alice);
+        lending.repay(id);
+        assertEq(usdc.balanceOf(alice), balance - 101);
+    }
+
+    function test_extendAtMaximumLTVSucceedsAtUnchangedPrice() public {
+        uint256 id = borrow(450e6);
+        vm.warp(block.timestamp + 1 days);
+        deliverPrice(1000);
+        uint256 interest = lending.interestOf(id);
+        assertGt(interest, 0);
+        vm.prank(alice);
+        lending.extend(id, 1200);
+        assertEq(getLoan(id).principal, 450e6);
+        assertEq(lending.debtOf(id), 450e6);
+        assertEq(lending.totalDebt(), 450e6);
+        vm.warp(block.timestamp + 1);
+        deliverPrice(999);
+        vm.expectRevert(CardLending.TooMuchDebt.selector);
+        vm.prank(alice);
+        lending.extend(id, 1200);
+    }
+
+    function test_extendRefusesRateAboveBorrowerLimit() public {
+        uint256 id = borrow(400e6);
+        vm.warp(block.timestamp + 10 days);
+        deliverPrice(1000);
+        lending.setAPR(10_000);
+        vm.expectRevert(CardLending.RateAboveLimit.selector);
+        vm.prank(alice);
+        lending.extend(id, 1200);
+        assertEq(getLoan(id).aprBps, 1200);
+        lending.setAPR(1200);
+        vm.prank(alice);
+        lending.extend(id, 1200);
+        assertEq(getLoan(id).aprBps, 1200);
+    }
+
+    function test_navFollowsAuctionCurveToFloorAndWriteOff() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        // Cash 9,604 of which 4 reserved; the loan is at par while its price is at or above the debt.
+        assertEq(pool.totalAssets(), 10_000e6);
+        assertEq(lending.auctionMark(id), 400e6);
+        vm.warp(block.timestamp + lending.PAR_WINDOW());
+        assertEq(pool.totalAssets(), 10_000e6);
+        vm.warp(block.timestamp + 1);
+        // One second past the par window the mark dips below the debt; the reserve still covers that sliver.
+        (uint256 marked, uint256 sliver) = lending.netReceivable();
+        assertLt(marked, 400e6);
+        assertEq(marked + sliver, 400e6);
+        assertEq(pool.totalAssets(), 10_000e6);
+        assertEq(lending.auctionMark(id), lending.auctionPrice(id));
+        vm.warp(getLoan(id).auctionStartedAt + 12 hours);
+        assertEq(lending.auctionPrice(id), 340e6);
+        // Reserve of 4 USDC covers part of the 60 USDC expected shortfall, so NAV is 9,600 + 340 + 4.
+        assertEq(pool.totalAssets(), 9_944e6);
+        (uint256 receivable, uint256 shortfall) = lending.netReceivable();
+        assertEq(receivable, 340e6);
+        assertEq(shortfall, 60e6);
+        vm.warp(getLoan(id).auctionStartedAt + 1 days);
+        assertEq(pool.totalAssets(), 9_804e6);
+        vm.warp(block.timestamp + lending.WRITE_OFF_DELAY() - 1);
+        assertEq(pool.totalAssets(), 9_804e6);
+        vm.warp(block.timestamp + 1);
+        assertEq(lending.auctionMark(id), 0);
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(lending.frozenDebt(), 400e6);
+        // A late floor purchase is a gain against the written-off mark and still settles the full debt.
+        vm.prank(bob);
+        lending.buy(id, 200e6, bob);
+        assertEq(pool.totalAssets(), 9_804e6);
+        assertEq(pool.reserve(), 0);
+        assertEq(lending.frozenDebt(), 0);
+        assertEq(lending.floorMark(), 0);
+        assertEq(lending.parDebt(), 0);
+        assertEq(lending.descentDebt(), 0);
+    }
+
+    function test_exitingLenderCannotLeaveUnsoldAuctionLossToOthers() public {
+        lending.setAPR(0);
+        usdc.mint(bob, 10_000e6);
+        vm.prank(bob);
+        pool.deposit(10_000e6, bob);
+        uint256 id = borrow(450e6);
+        vm.warp(block.timestamp + 1);
+        deliverPrice(100);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 1 days);
+        assertEq(lending.auctionPrice(id), 225e6);
+        uint256 recoverable = pool.availableLiquidity() + 225e6 + pool.reserve();
+        assertEq(pool.totalAssets(), recoverable);
+        uint256 shares = pool.balanceOf(lender);
+        vm.prank(lender);
+        uint256 received = pool.redeem(shares, lender, lender);
+        assertLe(received, recoverable / 2);
+        assertApproxEqAbs(received, recoverable / 2, 1);
+        vm.prank(bob);
+        lending.buy(id, 225e6, bob);
+        assertEq(pool.reserve(), 0);
+        assertApproxEqAbs(pool.previewRedeem(pool.balanceOf(bob)), recoverable / 2, 1);
+    }
+
+    function test_auctionBookAggregatesMatchPerLoanMarksWithRemovals() public {
+        lending.setAPR(0);
+        uint256[3] memory ids;
+        uint256[3] memory tokens;
+        tokens[0] = tokenId;
+        tokens[1] = nft.mint(alice, cardMetadata("100002"));
+        tokens[2] = nft.mint(alice, cardMetadata("100003"));
+        deliverPrice(1000);
+        for (uint256 i; i < 3; ++i) {
+            vm.prank(alice);
+            ids[i] = lending.borrow(tokens[i], 300e6 + i * 50e6);
+        }
+        vm.warp(getLoan(ids[0]).maturity);
+        lending.liquidate(ids[0]);
+        vm.warp(block.timestamp + 5 hours);
+        lending.liquidate(ids[1]);
+        vm.warp(block.timestamp + 5 hours);
+        lending.liquidate(ids[2]);
+        _assertBookMatchesLoans(ids);
+        vm.warp(block.timestamp + 3 hours); // first descending, second at par edge, third at par
+        _assertBookMatchesLoans(ids);
+        vm.prank(bob);
+        lending.buy(ids[1], type(uint256).max, bob); // removal from the middle of the queue
+        _assertBookMatchesLoans(ids);
+        vm.warp(block.timestamp + 20 hours); // first at floor, third descending
+        _assertBookMatchesLoans(ids);
+        lending.syncAuctions();
+        _assertBookMatchesLoans(ids);
+        // The sync walked past the first (at floor) and the closed second; the third is still descending.
+        assertEq(lending.parHead(), 3);
+        assertEq(lending.descentHead(), 2);
+        assertEq(lending.floorHead(), 0);
+        vm.prank(alice);
+        lending.repay(ids[0]); // removal at the floor
+        _assertBookMatchesLoans(ids);
+        vm.warp(block.timestamp + 3 days); // third written off
+        _assertBookMatchesLoans(ids);
+        (uint256 receivable, uint256 shortfall) = lending.netReceivable();
+        assertEq(receivable, 0);
+        assertEq(shortfall, 400e6);
+        vm.prank(bob);
+        lending.buy(ids[2], type(uint256).max, bob);
+        _assertBookMatchesLoans(ids);
+        assertEq(lending.frozenDebt(), 0);
+        assertEq(lending.parDebt() + lending.descentDebt() + lending.floorMark(), 0);
+    }
+
+    function _assertBookMatchesLoans(uint256[3] memory ids) internal view {
+        uint256 marks;
+        uint256 frozen;
+        uint256 descending;
+        for (uint256 i; i < 3; ++i) {
+            if (getLoan(ids[i]).state != CardLending.State.Auction) continue;
+            uint256 mark = lending.auctionMark(ids[i]);
+            marks += mark;
+            frozen += lending.debtOf(ids[i]);
+            if (mark != 0 && mark < lending.debtOf(ids[i]) && mark > Math.ceilDiv(lending.debtOf(ids[i]), 2)) {
+                ++descending;
+            }
+        }
+        (uint256 receivable, uint256 shortfall) = lending.netReceivable();
+        assertApproxEqAbs(receivable, marks, descending);
+        assertEq(receivable + shortfall, frozen);
+        assertEq(lending.frozenDebt(), frozen);
+    }
+
+    function testFuzz_auctionMarkNeverExceedsDebtOrPriceAndTracksPerLoan(uint32 gapSeed, uint32 timeSeed) public {
+        lending.setAPR(0);
+        uint256 otherToken = nft.mint(alice, cardMetadata("100002"));
+        deliverPrice(1000);
+        vm.startPrank(alice);
+        uint256 first = lending.borrow(tokenId, 400e6);
+        uint256 second = lending.borrow(otherToken, 250e6);
+        vm.stopPrank();
+        vm.warp(getLoan(first).maturity);
+        lending.liquidate(first);
+        vm.warp(block.timestamp + bound(uint256(gapSeed), 0, 3 days));
+        lending.liquidate(second);
+        vm.warp(block.timestamp + bound(uint256(timeSeed), 0, 3 days));
+        (uint256 receivable, uint256 shortfall) = lending.netReceivable();
+        uint256 marks = lending.auctionMark(first) + lending.auctionMark(second);
+        assertApproxEqAbs(receivable, marks, 2);
+        assertLe(receivable, 650e6);
+        assertEq(receivable + shortfall, 650e6);
+        assertLe(lending.auctionMark(first), lending.auctionPrice(first));
+        assertLe(lending.auctionMark(second), lending.auctionPrice(second));
+        uint256 navBefore = pool.totalAssets();
+        lending.syncAuctions();
+        assertEq(pool.totalAssets(), navBefore);
     }
 
     function test_auctionExactStartMidpointEndAndBeyond() public {
@@ -363,7 +576,7 @@ contract CardLendingTest is Fixture {
         lending.pause();
         vm.expectRevert(Pausable.EnforcedPause.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, 10_000);
         vm.expectRevert(Pausable.EnforcedPause.selector);
         lending.liquidate(id);
         vm.expectRevert(Pausable.EnforcedPause.selector);
@@ -397,7 +610,7 @@ contract CardLendingTest is Fixture {
         assertApproxEqAbs(lending.totalDebt(), sum, 1);
         deliverPrice(1000);
         vm.prank(alice);
-        lending.extend(a);
+        lending.extend(a, 10_000);
         vm.warp(block.timestamp + 2 days);
         vm.prank(alice);
         lending.repay(b);
@@ -431,8 +644,9 @@ contract CardLendingTest is Fixture {
         lending.setAPR(rate);
         uint256 id = borrow(amount);
         vm.warp(block.timestamp + elapsed);
-        uint256 interest = amount * rate * elapsed / (10000 * 365 days);
+        uint256 interest = Math.ceilDiv(amount * rate * elapsed, 10000 * 365 days);
         assertEq(lending.interestOf(id), interest);
+        assertGe(interest * 10000 * 365 days, amount * rate * elapsed);
         uint256 nav = pool.totalAssets();
         vm.prank(alice);
         lending.repay(id);

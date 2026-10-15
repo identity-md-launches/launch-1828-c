@@ -161,7 +161,7 @@ contract CardOracle is OracleAttestationConsumer, Guarded, ReentrancyGuard {
                 '"unit":"US dollars.","rounding":"Whole dollars rounded down."},',
                 '"guards":{"sources":["',
                 url,
-                '"],"minSources":1,"min":"0","max":"1000000000000"},',
+                '"],"minSources":1,"min":"1","max":"1000000000000"},',
                 '"consumer":{"chainId":',
                 block.chainid.toString(),
                 ',"verifyingContract":"',
@@ -254,16 +254,19 @@ contract CardOracle is OracleAttestationConsumer, Guarded, ReentrancyGuard {
             a.panelSize < r.panelSize || a.quorum < r.quorum || a.agreed < a.quorum || a.agreed > a.panelSize
                 || a.quorum > a.panelSize
         ) revert PanelTooWeak();
+        // The base check tolerates an issuance up to ISSUED_AT_TOLERANCE ahead of this block's clock;
+        // freshPrice refuses to serve such a price until the chain's clock catches up.
         _verifyAttestation(a, signature);
         if (
             a.chainId != r.observationChainId || a.requestId == bytes32(0) || a.questionHash == bytes32(0)
-                || a.fromBlock > a.toBlock || a.issuedAt < r.openedAt || a.issuedAt > block.timestamp
-                || a.expiresAt < a.issuedAt || a.expiresAt > uint256(a.issuedAt) + MAX_AGE
-                || block.timestamp - a.issuedAt > MAX_AGE || a.answer.length != 32
+                || a.fromBlock > a.toBlock || a.issuedAt < r.openedAt || a.expiresAt < a.issuedAt
+                || a.expiresAt > uint256(a.issuedAt) + MAX_AGE || uint256(a.issuedAt) + MAX_AGE < block.timestamp
+                || a.answer.length != 32
         ) revert BadAttestation();
         if (!allowed[r.classId] || r.version != classVersion[r.classId]) revert UnknownClass();
         uint256 dollars = decodeUint256(a);
-        if (dollars > MAX_USD) revert BadAttestation();
+        // Zero is the "column unavailable" reading the definitions forbid, never a valuation.
+        if (dollars == 0 || dollars > MAX_USD) revert BadAttestation();
         if (a.issuedAt <= prices[r.classId].issuedAt) revert StalePrice();
         _consume(a.requestId);
         r.pending = false;

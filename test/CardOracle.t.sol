@@ -54,12 +54,38 @@ contract CardOracleTest is Fixture {
         assertEq(oracle.pendingForClass(cardClass), bytes32(0));
     }
 
-    function test_zeroIsStoredButCannotSupportBorrowing() public {
-        deliverPrice(0);
-        assertEq(oracle.freshPrice(cardClass).price, 0);
-        vm.expectRevert();
-        vm.prank(alice);
-        lending.borrow(tokenId, 1e6);
+    function test_zeroAnswerRefusedAndDoorRefusalClearsClass() public {
+        bytes32 id = ask();
+        OracleAttestation.Attestation memory a = attestation(0);
+        bytes memory sig = sign(a);
+        vm.expectRevert(CardOracle.BadAttestation.selector);
+        _callback(id, a, sig);
+        assertTrue(oracle.request(id).pending);
+        assertFalse(oracle.consumed(a.requestId));
+        vm.expectRevert(CardOracle.StalePrice.selector);
+        oracle.freshPrice(cardClass);
+        // The body's guard asks the door for a minimum of 1, so a zero reading is refused before signing.
+        assertTrue(_contains(oracle.requestBody(cardClass), '"min":"1"'));
+        assertTrue(intake.fail(id, 1, bytes32("body_refused")));
+        assertFalse(oracle.request(id).pending);
+        assertEq(oracle.pendingForClass(cardClass), bytes32(0));
+        deliverPrice(1);
+        assertEq(oracle.freshPrice(cardClass).price, 1e6);
+    }
+
+    function _contains(bytes memory haystack, bytes memory needle) internal pure returns (bool) {
+        if (needle.length > haystack.length) return false;
+        for (uint256 i; i + needle.length <= haystack.length; ++i) {
+            bool same = true;
+            for (uint256 j; j < needle.length; ++j) {
+                if (haystack[i + j] != needle[j]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return true;
+        }
+        return false;
     }
 
     function test_wrongCallerUnknownRequestAndReplayRejected() public {
@@ -112,15 +138,22 @@ contract CardOracleTest is Fixture {
         bytes memory sig = sign(a);
         vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumer.AttestationExpired.selector, a.expiresAt));
         _callback(id, a, sig);
-        a.issuedAt = uint64(block.timestamp + 1);
-        a.expiresAt = a.issuedAt + 1 days;
-        sig = sign(a);
-        vm.expectRevert(CardOracle.BadAttestation.selector);
-        _callback(id, a, sig);
         a.issuedAt = uint64(block.timestamp + 301);
+        a.expiresAt = a.issuedAt + 1 days;
         sig = sign(a);
         vm.expectRevert(abi.encodeWithSelector(OracleAttestationConsumer.AttestationNotYetValid.selector, a.issuedAt));
         _callback(id, a, sig);
+        // Clock skew within the library's five-minute tolerance is accepted; the price serves once the chain catches up.
+        a.issuedAt = uint64(block.timestamp + 300);
+        a.expiresAt = a.issuedAt + 1 days;
+        sig = sign(a);
+        _callback(id, a, sig);
+        assertFalse(oracle.request(id).pending);
+        vm.expectRevert(CardOracle.StalePrice.selector);
+        oracle.freshPrice(cardClass);
+        vm.warp(block.timestamp + 300);
+        assertEq(oracle.freshPrice(cardClass).price, 1000e6);
+        assertEq(oracle.freshPrice(cardClass).issuedAt, a.issuedAt);
     }
 
     function test_timestampMustFollowOpeningAndLifetimeIsBounded() public {

@@ -77,6 +77,39 @@ contract AdminAndTokensTest is Fixture {
         assertFalse(lending.paused());
     }
 
+    function test_handoverMovesGuardianSeatHeldByOutgoingOwner() public {
+        address[3] memory guarded = [address(pool), address(oracle), address(lending)];
+        for (uint256 i; i < guarded.length; ++i) {
+            Guarded g = Guarded(guarded[i]);
+            assertEq(g.guardian(), address(this));
+            g.transferOwnership(alice);
+            assertEq(g.guardian(), address(this));
+            vm.prank(alice);
+            g.acceptOwnership();
+            assertEq(g.guardian(), alice);
+            vm.expectRevert(Guarded.NotGuardian.selector);
+            g.pause();
+            vm.prank(alice);
+            g.pause();
+            assertTrue(g.paused());
+            vm.prank(alice);
+            g.unpause();
+        }
+    }
+
+    function test_handoverKeepsSeparatelyAppointedGuardian() public {
+        lending.setGuardian(guardian);
+        lending.transferOwnership(alice);
+        vm.prank(alice);
+        lending.acceptOwnership();
+        assertEq(lending.guardian(), guardian);
+        vm.expectRevert(Guarded.NotGuardian.selector);
+        lending.pause();
+        vm.prank(guardian);
+        lending.pause();
+        assertTrue(lending.paused());
+    }
+
     function test_cardMetadataImmutableClassesGroupCopiesButNotGrades() public {
         MockCardNFT.Card memory card = nft.cardData(tokenId);
         assertEq(card.game, "Pokemon");

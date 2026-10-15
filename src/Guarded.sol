@@ -9,10 +9,7 @@ abstract contract Guarded is Admin, Pausable {
     address public guardian;
     event GuardianSet(address indexed guardian);
 
-    constructor(address admin) Admin(admin) {
-        guardian = admin;
-        emit GuardianSet(admin);
-    }
+    constructor(address admin) Admin(admin) {}
 
     function setGuardian(address next) external onlyOwner {
         if (next == address(0)) revert InvalidAddress();
@@ -27,5 +24,16 @@ abstract contract Guarded is Admin, Pausable {
 
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    /// @dev A guardian seat held by the outgoing owner moves with the ownership; a separately appointed
+    /// guardian keeps it. Also runs from the Ownable constructor, where it seats the initial admin.
+    function _transferOwnership(address next) internal override {
+        address previous = owner();
+        super._transferOwnership(next);
+        if (guardian == previous) {
+            guardian = next;
+            emit GuardianSet(next);
+        }
     }
 }

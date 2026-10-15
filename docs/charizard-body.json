@@ -22,7 +22,7 @@
       "https://www.pricecharting.com/game/pokemon-base-set/charizard-4"
     ],
     "minSources": 1,
-    "min": "0",
+    "min": "1",
     "max": "1000000000000"
   }
 }

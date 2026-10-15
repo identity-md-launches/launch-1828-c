@@ -20,7 +20,10 @@ contract CardPoolEdgesTest is Fixture {
         pool.draw(alice, 100, 101);
         vm.expectRevert(CardPool.InvalidAmount.selector);
         vm.prank(address(lending));
-        pool.settle(2, 1);
+        pool.settle(2, 1, 0, 0);
+        vm.expectRevert(CardPool.InvalidAmount.selector);
+        vm.prank(address(lending));
+        pool.settle(0, 1, 2, 0);
         assertEq(usdc.balanceOf(address(pool)), cash);
         assertEq(pool.reserve(), 0);
     }
@@ -89,7 +92,7 @@ contract CardPoolEdgesTest is Fixture {
     function test_unconfiguredPoolRejectsSettlementAndReserveCannotBeWithdrawn() public {
         CardPool standalone = new CardPool(address(this), usdc);
         vm.expectRevert(CardPool.LendingNotConfigured.selector);
-        standalone.settle(0, 1e6);
+        standalone.settle(0, 1e6, 0, 0);
         vm.startPrank(bob);
         usdc.approve(address(standalone), 10e6);
         standalone.fundReserve(10e6);

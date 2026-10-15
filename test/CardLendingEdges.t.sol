@@ -245,8 +245,10 @@ contract CardLendingEdgesTest is Fixture {
         assertEq(pool.totalAssets(), 10_000e6 - 2, "written-off auction counts only its reserve cover");
         vm.prank(bob);
         lending.buy(id, 2, bob);
-        assertEq(pool.reserve(), 0);
-        assertEq(pool.totalAssets(), 10_000e6, "floor sale recovers two units, reserve covers the third");
+        // The counted unit is spent on the third unit of debt; the two recovered units are held back as reserve.
+        assertEq(pool.reserve(), 2);
+        assertEq(pool.coveredReserve(), 0);
+        assertEq(pool.totalAssets(), 10_000e6 - 2, "floor sale of a written-off loan is NAV neutral");
         (receivable, shortfall) = lending.netReceivable();
         assertEq(receivable + shortfall, 0);
     }

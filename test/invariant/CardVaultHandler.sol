@@ -32,8 +32,21 @@ contract CardVaultHandler is Test {
     uint256 public cashOut;
     uint256 public reserveAdded;
     uint256 public reserveSpent;
+    uint256 public reserveHeld;
     uint256 public supply;
     uint256 public nonce;
+    uint256 public sandwiches;
+
+    /// @dev Pool state read immediately before a settlement; `claims` are the four actors' redeemable assets.
+    struct Snapshot {
+        uint256 nav;
+        uint256 cash;
+        uint256 reserve;
+        uint256 covered;
+        uint256 receivable;
+        uint256 supplyShares;
+        uint256[4] claims;
+    }
 
     constructor() {
         usdc = new MockUSDC(address(this));
@@ -126,20 +139,17 @@ contract CardVaultHandler is Test {
         uint256 amount = bound(seed, 1, _min(balance, 1000e6));
         uint256 shares = pool.totalSupply();
         uint256 nav = pool.totalAssets();
-        // Reserve cash only counts towards NAV while it is expected to cover an auction shortfall.
-        uint256 expectedDelta = amount;
-        if (toReserve) {
-            uint256 reserveBefore = pool.reserve();
-            (, uint256 shortfall) = lending.netReceivable();
-            expectedDelta = _min(reserveBefore + amount, shortfall) - _min(reserveBefore, shortfall);
-        }
+        uint256 covered = pool.coveredReserve();
+        // Reserve funding moves no NAV: it is checkpointed so that it covers only mark-downs that come later.
+        uint256 expectedDelta = toReserve ? 0 : amount;
         vm.prank(actor);
         if (toReserve) pool.fundReserve(amount);
         else usdc.transfer(address(pool), amount);
         cashIn += amount;
         if (toReserve) reserveAdded += amount;
         assertEq(pool.totalSupply(), shares, "donations cannot mint shares");
-        assertEq(pool.totalAssets(), nav + expectedDelta, "reserve counts only as shortfall cover");
+        assertEq(pool.totalAssets(), nav + expectedDelta, "reserve funding is NAV neutral, plain donation is not");
+        assertEq(pool.coveredReserve(), covered, "funding cannot re-rate a loss already carried");
         ++calls[this.donate.selector];
     }
 
@@ -169,10 +179,9 @@ contract CardVaultHandler is Test {
         uint256 beforeCash = usdc.balanceOf(actor);
         uint256 beforeNav = pool.totalAssets();
         uint256 fee = (amount + 99) / 100;
-        // The receivable replaces the cash; the fee only lifts NAV where it covers an expected auction loss.
+        // The receivable replaces the cash; the fee is checkpointed so it never lifts NAV on its own.
         uint256 reserveBefore = pool.reserve();
-        (, uint256 shortfall) = lending.netReceivable();
-        uint256 extraCover = _min(reserveBefore + fee, shortfall) - _min(reserveBefore, shortfall);
+        uint256 coveredBefore = pool.coveredReserve();
         uint256 id = lending.nextLoanId();
         vm.prank(actor);
         assertEq(lending.borrow(token, amount), id, "monotonic loan ID");
@@ -184,7 +193,9 @@ contract CardVaultHandler is Test {
         assertEq(l.borrower, actor, "borrower recorded");
         assertEq(l.maturity, vm.getBlockTimestamp() + 30 days, "term");
         assertEq(usdc.balanceOf(actor), beforeCash + amount - fee, "borrow pays net amount");
-        assertEq(pool.totalAssets(), beforeNav + extraCover, "draw swaps cash for receivable");
+        assertEq(pool.totalAssets(), beforeNav, "draw swaps cash for receivable without moving NAV");
+        assertEq(pool.reserve(), reserveBefore + fee, "fee is reserved");
+        assertEq(pool.coveredReserve(), coveredBefore, "a new fee covers only later mark-downs");
         ++calls[this.borrow.selector];
     }
 
@@ -196,9 +207,11 @@ contract CardVaultHandler is Test {
         uint256 debt = lending.debtOf(id);
         if (usdc.balanceOf(payer) < debt) return;
         uint256 beforeCash = usdc.balanceOf(payer);
+        Snapshot memory snap = _snapshot();
         vm.prank(payer);
         lending.repay(id);
         cashIn += debt;
+        _settled(snap, debt, debt);
         expectedHolder[l.tokenId] = l.borrower;
         closed[id] = true;
         assertEq(usdc.balanceOf(payer), beforeCash - debt, "repayment cash");
@@ -230,15 +243,17 @@ contract CardVaultHandler is Test {
             lending.extend(id, rate - 1);
             assertEq(keccak256(abi.encode(lending.loan(id))), untouched, "refused renewal leaves loan intact");
         }
-        uint256 beforeReserve = pool.reserve();
+        Snapshot memory snap = _snapshot();
         vm.prank(l.borrower);
         lending.extend(id, rate);
         cashIn += interest;
+        _settled(snap, interest, interest);
         CardLending.Loan memory renewed = lending.loan(id);
         assertEq(renewed.principal, l.principal, "extension cannot compound principal");
         assertEq(renewed.aprBps, lending.aprBps(), "extension snapshots new APR");
         assertEq(lending.debtOf(id), l.principal, "interest settled on extension");
-        assertEq(pool.reserve(), beforeReserve, "no second origination fee");
+        // No second origination fee: the reserve can only grow by the rounding unit the aggregate did not carry.
+        assertLe(pool.reserve(), snap.reserve + 1, "no second origination fee");
         assertEq(renewed.maturity, vm.getBlockTimestamp() + 30 days, "renewed term");
         ++calls[this.extend.selector];
     }
@@ -253,9 +268,13 @@ contract CardVaultHandler is Test {
         if (dollars != 0) _publish(dollars);
         else if (vm.getBlockTimestamp() < l.maturity) vm.warp(l.maturity);
         uint256 debt = lending.debtOf(id);
+        uint256 nav = pool.totalAssets();
         lending.liquidate(id);
         assertEq(lending.debtOf(id), debt, "auction freezes debt");
         assertEq(nft.ownerOf(l.tokenId), address(lending), "auction keeps custody");
+        // Opening an auction at par moves NAV by at most the loan's own rounding unit of interest.
+        assertGe(pool.totalAssets(), nav, "liquidation cannot lower NAV while the mark is at par");
+        assertLe(pool.totalAssets(), nav + 1, "liquidation cannot lift NAV beyond one rounding unit");
         ++calls[this.liquidate.selector];
     }
 
@@ -269,12 +288,12 @@ contract CardVaultHandler is Test {
         if (usdc.balanceOf(payer) < price) return;
         uint256 debt = l.auctionDebt;
         uint256 poolPayment = _min(price, debt);
-        uint256 cover = _min(reserveAdded - reserveSpent, debt - poolPayment);
         uint256 beforeCash = usdc.balanceOf(payer);
+        Snapshot memory snap = _snapshot();
         vm.prank(payer);
         lending.buy(id, price, receiver);
         cashIn += poolPayment;
-        reserveSpent += cover;
+        _settled(snap, poolPayment, debt);
         expectedSurplus[l.borrower] += price - poolPayment;
         expectedHolder[l.tokenId] = receiver;
         closed[id] = true;
@@ -297,20 +316,62 @@ contract CardVaultHandler is Test {
         ++calls[this.claim.selector];
     }
 
+    /// @dev A settlement wrapped in a same-block deposit and full redemption by the settling actor: the reviewer's
+    /// sandwich. It must cost the actor at least what the settlement itself costs, for any loan in any phase.
+    function sandwich(uint256 idSeed, uint256 who, uint256 depositSeed, bool byRepay) external {
+        if (pool.paused()) return;
+        uint256 id = _id(idSeed);
+        CardLending.Loan memory l = lending.loan(id);
+        if (l.state != CardLending.State.Auction && !(byRepay && l.state == CardLending.State.Active)) return;
+        address actor = actors[who % 4];
+        uint256 cost = byRepay ? lending.debtOf(id) : lending.auctionPrice(id);
+        uint256 balance = usdc.balanceOf(actor);
+        if (balance <= cost + 1) return;
+        uint256 amount = bound(depositSeed, 1, _min(balance - cost, 100_000e6));
+        if (pool.previewDeposit(amount) == 0) return;
+        uint256 poolPayment = byRepay ? cost : _min(cost, l.auctionDebt);
+        vm.startPrank(actor);
+        uint256 shares = pool.deposit(amount, actor);
+        cashIn += amount;
+        Snapshot memory snap = _snapshot();
+        if (byRepay) lending.repay(id);
+        else lending.buy(id, cost, actor);
+        cashIn += poolPayment;
+        _settled(snap, poolPayment, byRepay ? cost : l.auctionDebt);
+        uint256 redeemed = pool.previewRedeem(shares) == 0 ? 0 : pool.redeem(shares, actor, actor);
+        vm.stopPrank();
+        cashOut += redeemed;
+        if (!byRepay) expectedSurplus[l.borrower] += cost - poolPayment;
+        expectedHolder[l.tokenId] = byRepay ? l.borrower : actor;
+        closed[id] = true;
+        assertLe(usdc.balanceOf(actor) + cost, balance, "sandwiching a settlement cannot recover any of its cost");
+        assertLe(redeemed, amount, "the deposit cannot come back larger");
+        ++sandwiches;
+        ++calls[this.sandwich.selector];
+    }
+
     function elapse(uint256 seed) external {
         uint256 delta = bound(seed, 1, 40 days);
         uint256 debt = lending.totalDebt();
+        uint256 nav = pool.totalAssets();
+        uint256 covered = pool.coveredReserve();
+        (uint256 receivableBefore,) = lending.netReceivable();
         vm.warp(vm.getBlockTimestamp() + delta);
         assertGe(lending.totalDebt(), debt, "time cannot decrease outstanding debt");
+        // Time alone changes NAV only through interest (up) and mark-downs net of counted reserve (down).
+        uint256 navAfter = pool.totalAssets();
+        (uint256 receivableAfter,) = lending.netReceivable();
+        if (navAfter > nav) assertLe(navAfter - nav, lending.totalDebt() - debt, "NAV gain bounded by interest");
+        if (nav > navAfter) assertLe(nav - navAfter, receivableBefore - receivableAfter, "NAV loss bounded by marks");
+        assertGe(pool.coveredReserve() + 1, covered, "counted reserve does not fall with time");
         if (seed % 2 == 0) {
             // Materialising the lazy auction book must not change what the projection already reported.
-            (uint256 receivable, uint256 shortfall) = lending.netReceivable();
-            uint256 nav = pool.totalAssets();
+            (, uint256 shortfall) = lending.netReceivable();
             lending.syncAuctions();
-            (uint256 receivableAfter, uint256 shortfallAfter) = lending.netReceivable();
-            assertEq(receivableAfter, receivable, "sync preserves receivable");
-            assertEq(shortfallAfter, shortfall, "sync preserves expected shortfall");
-            assertEq(pool.totalAssets(), nav, "sync preserves NAV");
+            (uint256 receivableSynced, uint256 shortfallSynced) = lending.netReceivable();
+            assertEq(receivableSynced, receivableAfter, "sync preserves receivable");
+            assertEq(shortfallSynced, shortfall, "sync preserves expected shortfall");
+            assertEq(pool.totalAssets(), navAfter, "sync preserves NAV");
         }
         ++calls[this.elapse.selector];
     }
@@ -351,7 +412,7 @@ contract CardVaultHandler is Test {
 
     function checkAccounting() external view {
         assertEq(usdc.balanceOf(address(pool)), cashIn - cashOut, "pool cash conservation");
-        assertEq(pool.reserve(), reserveAdded - reserveSpent, "reserve flow conservation");
+        assertEq(pool.reserve(), reserveAdded + reserveHeld - reserveSpent, "reserve flow conservation");
         assertGe(usdc.balanceOf(address(pool)), pool.reserve(), "reserve always cash backed");
         uint256 tokenBalances =
             usdc.balanceOf(address(this)) + usdc.balanceOf(address(pool)) + usdc.balanceOf(address(lending));
@@ -378,7 +439,7 @@ contract CardVaultHandler is Test {
         uint256 activeCount;
         uint256 custodyCount;
         uint256 markSum;
-        uint256 descending;
+        uint256 rounded;
         uint256 next = lending.nextLoanId();
         for (uint256 id = 1; id < next; ++id) {
             CardLending.Loan memory l = lending.loan(id);
@@ -393,13 +454,17 @@ contract CardVaultHandler is Test {
                 frozen += l.auctionDebt;
                 assertEq(lending.interestOf(id), 0, "auction accrues no interest");
                 assertEq(lending.debtOf(id), l.auctionDebt, "auction debt fixed");
-                // Independent mark: what a buyer would pay the pool right now, zero once written off.
+                // Independent mark: what a buyer would pay the pool right now until the floor, then a straight
+                // line from half the debt to zero over the following day.
                 uint256 elapsed = vm.getBlockTimestamp() - l.auctionStartedAt;
                 uint256 quote = lending.auctionPrice(id);
-                uint256 mark = elapsed >= 2 days ? 0 : _min(l.auctionDebt, quote);
-                assertEq(lending.auctionMark(id), mark, "per-loan mark is min(debt, quote) until write-off");
+                uint256 mark;
+                if (elapsed < 1 days) mark = _min(l.auctionDebt, quote);
+                else if (elapsed < 2 days) mark = _ceilDiv(l.auctionDebt * (2 days - elapsed), 2 days);
+                assertEq(lending.auctionMark(id), mark, "per-loan mark follows the curve then the write-down");
+                assertLe(mark, quote, "a mark never exceeds the sale price");
                 markSum += mark;
-                if (elapsed > 24_685 && elapsed < 1 days) ++descending;
+                if (elapsed > 24_685 && elapsed < 2 days) ++rounded;
                 if (elapsed <= 24_685) assertGe(quote, l.auctionDebt, "par window quote covers debt");
                 else assertLe(quote, l.auctionDebt, "descent quote never above debt");
             } else {
@@ -421,16 +486,18 @@ contract CardVaultHandler is Test {
         // Each loan rounds its own interest up, so settling them one by one collects at least the aggregate.
         assertLe(lending.totalDebt(), individualDebts, "aggregate never exceeds what settlement collects");
         assertLe(individualDebts - lending.totalDebt(), activeCount == 0 ? 0 : activeCount - 1, "fractional debt bound");
-        // Receivable model: active debt plus per-loan marks. The book sums the descending curve before
-        // rounding once, so it may sit up to one base unit per extra descending auction below the sum.
+        // Receivable model: active debt plus per-loan marks. The book sums each curved phase before rounding
+        // once, so it may sit up to one base unit per extra descending or decaying auction below the sum.
         (uint256 receivable, uint256 shortfall) = lending.netReceivable();
         uint256 modelReceivable = principal + roundedInterest + markSum;
         assertLe(receivable, modelReceivable, "book cannot mark auctions above their quotes");
-        assertLe(modelReceivable - receivable, descending == 0 ? 0 : descending - 1, "book rounding bound");
+        assertLe(modelReceivable - receivable, rounded == 0 ? 0 : rounded - 1, "book rounding bound");
         assertEq(receivable + shortfall, lending.totalDebt(), "marks and expected losses partition the debt");
-        uint256 cover = _min(pool.reserve(), shortfall);
+        uint256 cover = pool.coveredReserve();
+        assertLe(cover, _min(pool.reserve(), shortfall), "counted reserve within the reserve and the shortfall");
         assertEq(pool.totalAssets(), cashIn - cashOut - pool.reserve() + receivable + cover, "NAV backing");
         assertLe(pool.totalAssets(), cashIn - cashOut - pool.reserve() + lending.totalDebt(), "NAV never above par");
+        assertGe(pool.totalAssets(), cashIn - cashOut - pool.reserve() + receivable, "NAV never below cash plus marks");
         assertEq(nft.balanceOf(address(lending)), custodyCount, "no unrecorded collateral");
         for (uint256 token = 1; token <= 12; ++token) {
             assertEq(nft.ownerOf(token), expectedHolder[token], "NFT follows authorized state transitions");
@@ -452,8 +519,10 @@ contract CardVaultHandler is Test {
                 usdc.mint(address(this), debt - balance);
                 supply += debt - balance;
             }
+            Snapshot memory snap = _snapshot();
             lending.repay(id);
             cashIn += debt;
+            _settled(snap, debt, debt);
             expectedHolder[l.tokenId] = l.borrower;
             closed[id] = true;
         }
@@ -472,6 +541,50 @@ contract CardVaultHandler is Test {
         assertEq(lending.totalSurplus(), 0, "all surplus can be claimed");
         assertEq(nft.balanceOf(address(lending)), 0, "all collateral released");
         this.checkAccounting();
+    }
+
+    function _snapshot() internal view returns (Snapshot memory s) {
+        s.nav = pool.totalAssets();
+        s.cash = usdc.balanceOf(address(pool));
+        s.reserve = pool.reserve();
+        s.covered = pool.coveredReserve();
+        (s.receivable,) = lending.netReceivable();
+        s.supplyShares = pool.totalSupply();
+        for (uint256 i; i < 4; ++i) {
+            s.claims[i] = _claim(actors[i]);
+        }
+    }
+
+    /// @dev Every settlement hands the pool `payment` against `debt` and leaves NAV exactly where it was: the
+    /// reserve counted as cover is spent first, and whatever the payment collects above the released mark is
+    /// held back as reserve rather than realised as a gain any lender could time.
+    function _settled(Snapshot memory s, uint256 payment, uint256 debt) internal {
+        assertEq(pool.totalAssets(), s.nav, "settlement never moves NAV");
+        assertEq(usdc.balanceOf(address(pool)), s.cash + payment, "pool receives exactly the payment");
+        assertEq(pool.totalSupply(), s.supplyShares, "settlement mints no shares");
+        (uint256 receivableAfter,) = lending.netReceivable();
+        uint256 released = s.receivable - receivableAfter;
+        assertLe(released, debt, "a settlement releases at most the debt it closes");
+        assertGe(payment, released, "a settlement collects at least the mark it releases");
+        uint256 used = _min(s.covered, debt - payment);
+        assertGe(pool.reserve() + used, s.reserve, "reserve spends at most the counted cover");
+        uint256 heldBack = pool.reserve() + used - s.reserve;
+        assertLe(heldBack, payment - released, "held back at most the recovery above the mark");
+        reserveSpent += used;
+        reserveHeld += heldBack;
+        assertLe(pool.coveredReserve(), s.covered, "settlement cannot count more reserve than before");
+        for (uint256 i; i < 4; ++i) {
+            assertGe(_claim(actors[i]), s.claims[i], "no lender claim falls on a settlement");
+            assertLe(_claim(actors[i]), s.claims[i] + 1, "no lender claim rises on a settlement");
+        }
+    }
+
+    function _claim(address holder) internal view returns (uint256) {
+        return pool.previewRedeem(pool.balanceOf(holder));
+    }
+
+    function _ceilDiv(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a == 0 ? 0 : (a - 1) / b + 1;
     }
 
     function _id(uint256 seed) internal view returns (uint256) {

@@ -14,7 +14,8 @@ contract CardVaultInvariantTest is Test {
         vm.chainId(11155111);
         vm.warp(1_800_000_000);
         handler = new CardVaultHandler();
-        bytes4[] memory selectors = new bytes4[](13);
+        bytes4[] memory selectors = new bytes4[](14);
+        selectors[13] = handler.sandwich.selector;
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.withdraw.selector;
         selectors[2] = handler.donate.selector;
@@ -64,6 +65,20 @@ contract CardVaultInvariantTest is Test {
         handler.liquidate(2, false);
         handler.elapse(1 days);
         handler.buy(2, 2, 3);
+        // Sandwiched settlements in every phase: at par, mid-descent, written off, and an active repayment.
+        handler.borrow(5, 400e6);
+        handler.borrow(8, 300e6);
+        handler.borrow(11, 200e6);
+        handler.liquidate(3, false);
+        handler.sandwich(3, 1, 5_000e6, false);
+        handler.liquidate(4, false);
+        handler.elapse(12 hours);
+        handler.sandwich(4, 2, 5_000e6, true);
+        handler.liquidate(5, false);
+        handler.elapse(2 days);
+        handler.sandwich(5, 1, 5_000e6, false);
+        handler.borrow(3, 100e6);
+        handler.sandwich(6, 3, 5_000e6, true);
         handler.admin(0, true, true);
         handler.withdraw(0, 1e6, false);
         handler.admin(1200, false, false);
@@ -77,6 +92,8 @@ contract CardVaultInvariantTest is Test {
         assertEq(handler.calls(handler.buy.selector), 2);
         assertEq(handler.calls(handler.claim.selector), 1);
         assertGt(handler.reserveSpent(), 0);
+        assertGt(handler.reserveHeld(), 0);
+        assertEq(handler.sandwiches(), 4);
         assertEq(handler.calls(handler.roundTrip.selector), 20);
     }
 }

@@ -82,7 +82,7 @@ contract OracleLifecycleHandler is Test {
         CardOracle.Request memory request = oracle.request(r.intakeId);
         if (vm.getBlockTimestamp() >= request.deadline) return;
         vm.warp(vm.getBlockTimestamp() + 1);
-        uint256 dollars = bound(priceSeed, 0, 1_000_000_000_000);
+        uint256 dollars = bound(priceSeed, 1, 1_000_000_000_000);
         OracleAttestation.Attestation memory a = _answer(r, dollars);
         bytes memory signature = _sign(a);
         if (relay) {
@@ -148,6 +148,33 @@ contract OracleLifecycleHandler is Test {
         vm.prank(payers[0]);
         oracle.onFailure(r.intakeId, 2, bytes32("disagreed"), 0, 0, "");
         ++calls[this.rejectWrongSender.selector];
+    }
+
+    /// @dev A signed zero or oversize dollar figure is refused on both paths and leaves the request open
+    /// and the UUID unconsumed, so a later valid answer for the same request can still land.
+    function rejectBadFigure(uint256 classSeed, bool oversize, bool relay) external {
+        uint256 c = classSeed % 3;
+        if (pending[c] == 0) return;
+        Opened storage r = opened[indexPlusOne[pending[c]] - 1];
+        if (vm.getBlockTimestamp() > oracle.request(r.intakeId).deadline) return;
+        OracleAttestation.Attestation memory a = _answer(r, oversize ? 1_000_000_000_001 : 0);
+        bytes memory signature = _sign(a);
+        if (relay) {
+            if (!r.bound) {
+                oracle.bindRelay(r.intakeId, r.uuid, a.questionHash);
+                r.bound = true;
+            }
+            vm.expectRevert(CardOracle.BadAttestation.selector);
+            vm.prank(payers[0]);
+            oracle.submit(a, signature);
+        } else {
+            (bool ok, bytes memory reason) = r.source.deliver(r.intakeId, a, signature);
+            assertFalse(ok, "bad figure must not settle");
+            assertEq(bytes4(reason), CardOracle.BadAttestation.selector, "bad figure reason");
+        }
+        assertTrue(oracle.request(r.intakeId).pending, "refused answer keeps request open");
+        assertFalse(oracle.consumed(r.uuid), "refused answer does not consume the UUID");
+        ++calls[this.rejectBadFigure.selector];
     }
 
     function rejectReplay(uint256 seed) external {
@@ -279,7 +306,7 @@ contract CardOracleInvariantTest is Test {
         vm.chainId(11155111);
         vm.warp(1_800_000_000);
         handler = new OracleLifecycleHandler();
-        bytes4[] memory selectors = new bytes4[](11);
+        bytes4[] memory selectors = new bytes4[](12);
         selectors[0] = handler.open.selector;
         selectors[1] = handler.deliver.selector;
         selectors[2] = handler.bind.selector;
@@ -291,6 +318,7 @@ contract CardOracleInvariantTest is Test {
         selectors[8] = handler.catalog.selector;
         selectors[9] = handler.elapse.selector;
         selectors[10] = handler.donate.selector;
+        selectors[11] = handler.rejectBadFigure.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector(address(handler), selectors));
     }
@@ -306,8 +334,10 @@ contract CardOracleInvariantTest is Test {
         handler.rejectWrongSender(0);
         handler.bind(0);
         handler.configure(99, true);
+        handler.rejectBadFigure(0, false, true);
+        handler.rejectBadFigure(1, true, false);
         handler.deliver(0, 1000, true);
-        handler.deliver(1, 0, false);
+        handler.deliver(1, 1, false);
         handler.fail(2, true);
         handler.rejectReplay(0);
         handler.configure(40, false);
@@ -326,5 +356,6 @@ contract CardOracleInvariantTest is Test {
         assertEq(handler.calls(handler.fail.selector), 1);
         assertEq(handler.calls(handler.timeout.selector), 1);
         assertEq(handler.calls(handler.rejectReplay.selector), 2);
+        assertEq(handler.calls(handler.rejectBadFigure.selector), 2);
     }
 }

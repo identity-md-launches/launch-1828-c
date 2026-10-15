@@ -26,7 +26,7 @@ contract CrossEntryAuctionReceiver is IERC721Receiver {
         bytes[] memory attempts = new bytes[](6);
         attempts[0] = abi.encodeCall(lending.borrow, (tokenId, 100e6));
         attempts[1] = abi.encodeCall(lending.repay, (otherLoan));
-        attempts[2] = abi.encodeCall(lending.extend, (otherLoan));
+        attempts[2] = abi.encodeCall(lending.extend, (otherLoan, type(uint16).max));
         attempts[3] = abi.encodeCall(lending.liquidate, (otherLoan));
         attempts[4] = abi.encodeCall(lending.buy, (otherLoan, type(uint256).max, address(this)));
         attempts[5] = abi.encodeCall(lending.claimSurplus, (address(this)));
@@ -170,12 +170,12 @@ contract CardLendingEdgesTest is Fixture {
             abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(lending), 0, interest)
         );
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, type(uint16).max);
         assertEq(_accountingHash(id), beforeState, "failed interest payment must roll back renewal");
         vm.prank(alice);
         usdc.approve(address(lending), interest);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, type(uint16).max);
         assertEq(getLoan(id).aprBps, 2400);
         assertEq(lending.interestOf(id), 0);
         assertEq(usdc.allowance(address(lending), address(pool)), 0);
@@ -188,7 +188,7 @@ contract CardLendingEdgesTest is Fixture {
         // Alice's original approval let lending take custody; it confers no loan authority on Bob.
         vm.expectRevert(CardLending.NotBorrower.selector);
         vm.prank(bob);
-        lending.extend(id);
+        lending.extend(id, type(uint16).max);
         assertEq(getLoan(id).borrower, alice);
         assertEq(nft.ownerOf(tokenId), address(lending));
     }
@@ -204,7 +204,7 @@ contract CardLendingEdgesTest is Fixture {
         vm.warp(maturity);
         vm.expectRevert(CardLending.WrongState.selector);
         vm.prank(alice);
-        lending.extend(id);
+        lending.extend(id, type(uint16).max);
         lending.liquidate(id);
         assertEq(getLoan(id).auctionStartedAt, maturity);
         assertEq(lending.debtOf(id), 400e6);
@@ -237,11 +237,18 @@ contract CardLendingEdgesTest is Fixture {
         assertEq(lending.auctionPrice(id), 2);
         assertEq(lending.totalDebt(), 3);
         assertEq(lending.interestNumerator(), 0);
-        uint256 nav = pool.totalAssets();
+        // Written off: the three-unit debt is carried at zero, with the one-unit reserve as expected cover.
+        (uint256 receivable, uint256 shortfall) = lending.netReceivable();
+        assertEq(receivable, 0);
+        assertEq(shortfall, 3);
+        assertEq(lending.auctionMark(id), 0);
+        assertEq(pool.totalAssets(), 10_000e6 - 2, "written-off auction counts only its reserve cover");
         vm.prank(bob);
         lending.buy(id, 2, bob);
         assertEq(pool.reserve(), 0);
-        assertEq(pool.totalAssets(), nav, "one-unit reserve covers one-unit shortfall");
+        assertEq(pool.totalAssets(), 10_000e6, "floor sale recovers two units, reserve covers the third");
+        (receivable, shortfall) = lending.netReceivable();
+        assertEq(receivable + shortfall, 0);
     }
 
     /// forge-config: default.fuzz.runs = 1000
@@ -327,7 +334,7 @@ contract CardLendingEdgesTest is Fixture {
         vm.expectRevert(CardLending.WrongState.selector);
         lending.repay(id);
         vm.expectRevert(CardLending.WrongState.selector);
-        lending.extend(id);
+        lending.extend(id, type(uint16).max);
         vm.expectRevert(CardLending.WrongState.selector);
         lending.liquidate(id);
         vm.expectRevert(CardLending.WrongState.selector);

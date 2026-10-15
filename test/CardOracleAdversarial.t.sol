@@ -153,7 +153,7 @@ contract CardOracleAdversarialTest is Fixture {
         else if (field == 1) a.questionHash = bytes32(0);
         else if (field == 2) a.fromBlock = a.toBlock + 1;
         else if (field == 3) --a.issuedAt;
-        else if (field == 4) ++a.issuedAt;
+        else if (field == 4) a.answer = abi.encode(uint256(0)); // "column unavailable" is not a valuation
         else if (field == 5) ++a.expiresAt;
         else if (field == 6) a.answer = abi.encode(uint256(1000), uint256(0));
         else if (field == 7) a.chainId = 11155111; // Observation chain is 1, consumer chain is Sepolia.

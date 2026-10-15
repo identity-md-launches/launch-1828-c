@@ -1,0 +1,44 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MockUSDC",
+      "constructorArgs": [
+        "$owner"
+      ]
+    },
+    {
+      "contract": "MockCardNFT",
+      "constructorArgs": [
+        "$owner"
+      ]
+    },
+    {
+      "contract": "CardPool",
+      "constructorArgs": [
+        "$owner",
+        "$contract:MockUSDC"
+      ]
+    },
+    {
+      "contract": "CardOracle",
+      "constructorArgs": [
+        "$owner",
+        "0xa43e6f75ee006411f79ac1c84120606c2330de82",
+        "0x44a1cd38474fb1748400e7deb5f8d786cce3f89a",
+        "0x5598aa9146215bc13eb26f2c692ad1461fd32982"
+      ]
+    },
+    {
+      "contract": "CardLending",
+      "constructorArgs": [
+        "$owner",
+        "$contract:MockCardNFT",
+        "$contract:CardPool",
+        "$contract:CardOracle",
+        "$contract:MockUSDC"
+      ]
+    }
+  ],
+  "notes": "CardVault application contracts for Sepolia (11155111), in constructor dependency order. All five admins and the initial guardians of CardPool, CardOracle and CardLending are $owner. MockUSDC has name C, symbol AUREON, six decimals and an initial supply of 1,000,000 tokens minted to $owner; subsequent minting is owner-only. MockCardNFT issues card collateral with immutable metadata and derived class IDs. CardPool is the MockUSDC ERC-4626 vault with a segregated loss reserve. CardOracle uses the specified Sepolia Intake and test IMD addresses, and the oracle signer recorded in script/SepoliaConfig.sol and confirmed by https://api.imd.fun/oracle/requests?limit=1 on 2026-10-15. Its constructor fixes the initial request fee at 0.5 IMD and action at bytes32(oracle.request@oracle-1); the attestation domain uses the deployed consumer address and chain. CardLending starts at 12% APR with a 30-day term, 45% borrowing LTV, 1% origination fee and 24-hour liquidation auctions. Accepted-source limitation: CardPool.lending is unset at construction, and borrowing requires the owner's one-time setLending binding to CardLending. Card classes also require owner configuration and the pool requires deposited liquidity. These operations are not encoded as initialization calls in this manifest; constructor deployment alone does not make borrowing operational. No live application deployment, oracle callback or Sepolia borrow is claimed."
+}

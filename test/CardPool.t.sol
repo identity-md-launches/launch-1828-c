@@ -99,7 +99,7 @@ contract CardPoolTest is Fixture {
         vm.expectRevert(CardPool.NotLending.selector);
         pool.draw(bob, 100e6, 1e6);
         vm.expectRevert(CardPool.NotLending.selector);
-        pool.settle(0, 100e6);
+        pool.settle(0, 100e6, 0, 0);
         vm.expectRevert(CardPool.LendingAlreadyConfigured.selector);
         pool.setLending(bob);
         CardPool unconfigured = new CardPool(address(this), usdc);

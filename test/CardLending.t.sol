@@ -322,19 +322,31 @@ contract CardLendingTest is Fixture {
         assertEq(shortfall, 60e6);
         vm.warp(getLoan(id).auctionStartedAt + 1 days);
         assertEq(pool.totalAssets(), 9_804e6);
-        vm.warp(block.timestamp + lending.WRITE_OFF_DELAY() - 1);
-        assertEq(pool.totalAssets(), 9_804e6);
+        assertEq(lending.auctionMark(id), 200e6);
+        // Unsold at the floor, the mark is written down linearly: half way through the delay it is 100.
+        vm.warp(block.timestamp + lending.WRITE_OFF_DELAY() / 2);
+        assertEq(lending.auctionMark(id), 100e6);
+        assertEq(lending.auctionPrice(id), 200e6);
+        assertEq(pool.totalAssets(), 9_704e6);
+        vm.warp(getLoan(id).auctionStartedAt + 2 days - 1);
+        uint256 lastMark = lending.auctionMark(id);
+        assertEq(lastMark, Math.ceilDiv(uint256(400e6), 2 * 1 days));
+        assertEq(pool.totalAssets(), 9_604e6 + lastMark);
         vm.warp(block.timestamp + 1);
         assertEq(lending.auctionMark(id), 0);
         assertEq(pool.totalAssets(), 9_604e6);
         assertEq(lending.frozenDebt(), 400e6);
-        // A late floor purchase is a gain against the written-off mark and still settles the full debt.
+        // A late floor purchase settles the full debt without moving NAV: the 200 above the written-off mark
+        // is held back as reserve for later shortfalls instead of becoming an instant gain.
         vm.prank(bob);
         lending.buy(id, 200e6, bob);
-        assertEq(pool.totalAssets(), 9_804e6);
-        assertEq(pool.reserve(), 0);
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(pool.reserve(), 200e6);
+        assertEq(pool.coveredReserve(), 0);
+        assertEq(pool.availableLiquidity(), 9_604e6);
         assertEq(lending.frozenDebt(), 0);
-        assertEq(lending.floorMark(), 0);
+        assertEq(lending.decayDebt(), 0);
+        assertEq(lending.decayWeight(), 0);
         assertEq(lending.parDebt(), 0);
         assertEq(lending.descentDebt(), 0);
     }
@@ -391,13 +403,15 @@ contract CardLendingTest is Fixture {
         _assertBookMatchesLoans(ids);
         lending.syncAuctions();
         _assertBookMatchesLoans(ids);
-        // The sync walked past the first (at floor) and the closed second; the third is still descending.
+        // The sync walked past the first (decaying past its floor) and the closed second; the third still descends.
         assertEq(lending.parHead(), 3);
         assertEq(lending.descentHead(), 2);
-        assertEq(lending.floorHead(), 0);
+        assertEq(lending.decayHead(), 0);
+        assertEq(lending.decayDebt(), 300e6);
         vm.prank(alice);
-        lending.repay(ids[0]); // removal at the floor
+        lending.repay(ids[0]); // removal while decaying
         _assertBookMatchesLoans(ids);
+        assertEq(lending.decayDebt(), 0);
         vm.warp(block.timestamp + 3 days); // third written off
         _assertBookMatchesLoans(ids);
         (uint256 receivable, uint256 shortfall) = lending.netReceivable();
@@ -407,24 +421,22 @@ contract CardLendingTest is Fixture {
         lending.buy(ids[2], type(uint256).max, bob);
         _assertBookMatchesLoans(ids);
         assertEq(lending.frozenDebt(), 0);
-        assertEq(lending.parDebt() + lending.descentDebt() + lending.floorMark(), 0);
+        assertEq(lending.parDebt() + lending.descentDebt() + lending.decayDebt() + lending.decayWeight(), 0);
     }
 
     function _assertBookMatchesLoans(uint256[3] memory ids) internal view {
         uint256 marks;
         uint256 frozen;
-        uint256 descending;
+        uint256 rounded;
         for (uint256 i; i < 3; ++i) {
             if (getLoan(ids[i]).state != CardLending.State.Auction) continue;
             uint256 mark = lending.auctionMark(ids[i]);
             marks += mark;
             frozen += lending.debtOf(ids[i]);
-            if (mark != 0 && mark < lending.debtOf(ids[i]) && mark > Math.ceilDiv(lending.debtOf(ids[i]), 2)) {
-                ++descending;
-            }
+            if (mark != 0 && mark < lending.debtOf(ids[i])) ++rounded;
         }
         (uint256 receivable, uint256 shortfall) = lending.netReceivable();
-        assertApproxEqAbs(receivable, marks, descending);
+        assertApproxEqAbs(receivable, marks, rounded);
         assertEq(receivable + shortfall, frozen);
         assertEq(lending.frozenDebt(), frozen);
     }
@@ -525,6 +537,153 @@ contract CardLendingTest is Fixture {
         lending.buy(id, 200e6, bob);
         assertEq(pool.reserve(), 104e6);
         assertEq(pool.totalAssets(), nav);
+    }
+
+    /// Reviewer finding 965d7546, case A: a floor purchase of a written-off loan is NAV-neutral, so a same-block
+    /// deposit/redeem around it takes none of the pool's recovery.
+    function test_settlingWrittenOffAuctionCannotBeSandwichedForPoolRecovery() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 2 days);
+        assertEq(lending.auctionMark(id), 0);
+        assertEq(lending.auctionPrice(id), 200e6);
+        assertEq(pool.totalAssets(), 9_604e6);
+        uint256 bobBefore = usdc.balanceOf(bob);
+        uint256 lenderClaim = pool.previewRedeem(pool.balanceOf(lender));
+        vm.startPrank(bob);
+        uint256 shares = pool.deposit(10_000e6, bob);
+        lending.buy(id, 200e6, bob);
+        pool.redeem(shares, bob, bob);
+        vm.stopPrank();
+        uint256 cost = bobBefore - usdc.balanceOf(bob);
+        assertGe(cost, 200e6);
+        assertLe(cost, 200e6 + 1);
+        assertGe(pool.previewRedeem(pool.balanceOf(lender)), lenderClaim);
+        assertApproxEqAbs(pool.totalAssets(), 9_604e6, 1);
+        assertEq(pool.reserve(), 200e6);
+        assertEq(pool.coveredReserve(), 0);
+        assertEq(nft.ownerOf(tokenId), bob);
+    }
+
+    /// Reviewer finding 965d7546, case B: repaying an auctioned loan in full is NAV-neutral too; the borrower pays the
+    /// whole frozen debt and the part above the mark becomes reserve.
+    function test_repayingAuctionedLoanCannotBeSandwichedForPoolRecovery() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 2 days);
+        usdc.mint(alice, 1_000_000e6);
+        vm.prank(alice);
+        usdc.approve(address(pool), type(uint256).max);
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        uint256 lenderClaim = pool.previewRedeem(pool.balanceOf(lender));
+        vm.startPrank(alice);
+        uint256 shares = pool.deposit(1_000_000e6, alice);
+        lending.repay(id);
+        pool.redeem(shares, alice, alice);
+        vm.stopPrank();
+        uint256 cost = aliceBefore - usdc.balanceOf(alice);
+        assertGe(cost, 400e6);
+        assertLe(cost, 400e6 + 1);
+        assertEq(nft.ownerOf(tokenId), alice);
+        assertGe(pool.previewRedeem(pool.balanceOf(lender)), lenderClaim);
+        assertApproxEqAbs(pool.totalAssets(), 9_604e6, 1);
+        assertEq(pool.reserve(), 400e6);
+        assertEq(pool.coveredReserve(), 0);
+    }
+
+    function test_repayDuringDescentHoldsBackRecoveryAsReserve() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 12 hours);
+        assertEq(pool.totalAssets(), 9_944e6); // 9,600 cash + 340 mark + the 4 reserve covering part of the 60
+        vm.prank(alice);
+        lending.repay(id);
+        assertEq(pool.totalAssets(), 9_944e6);
+        assertEq(pool.reserve(), 60e6);
+        assertEq(pool.coveredReserve(), 0);
+        assertEq(pool.availableLiquidity(), 9_944e6);
+        assertEq(lending.totalDebt(), 0);
+    }
+
+    function test_heldBackRecoveryCoversLaterShortfallsOnly() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 2 days);
+        vm.prank(bob);
+        lending.buy(id, 200e6, bob);
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(pool.reserve(), 200e6);
+        assertEq(pool.coveredReserve(), 0);
+        // A second loan's auction descends to its floor; the held-back 200 absorbs that whole shortfall, so lender
+        // NAV never moves, and the floor sale then spends exactly the counted reserve.
+        uint256 other = nft.mint(alice, cardMetadata("100002"));
+        deliverPrice(1000);
+        vm.prank(alice);
+        uint256 second = lending.borrow(other, 400e6);
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(pool.reserve(), 204e6);
+        vm.warp(getLoan(second).maturity);
+        lending.liquidate(second);
+        assertEq(pool.totalAssets(), 9_604e6);
+        vm.warp(block.timestamp + 12 hours);
+        assertEq(pool.coveredReserve(), 60e6);
+        assertEq(pool.totalAssets(), 9_604e6);
+        vm.warp(block.timestamp + 12 hours);
+        assertEq(pool.coveredReserve(), 200e6);
+        assertEq(pool.totalAssets(), 9_604e6);
+        vm.prank(bob);
+        lending.buy(second, 200e6, bob);
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(pool.reserve(), 4e6);
+        assertEq(pool.coveredReserve(), 0);
+        assertEq(pool.availableLiquidity(), 9_604e6);
+    }
+
+    function test_reserveDonationAfterLossMovesNoNAVAndCoversLaterShortfallsOnly() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        vm.warp(block.timestamp + 1 days);
+        assertEq(pool.totalAssets(), 9_804e6);
+        vm.prank(bob);
+        pool.fundReserve(1_000e6);
+        assertEq(pool.totalAssets(), 9_804e6);
+        assertEq(pool.coveredReserve(), 4e6);
+        // The floor sale spends only the 4 that NAV counted; the donation is kept for later mark-downs.
+        vm.prank(bob);
+        lending.buy(id, 200e6, bob);
+        assertEq(pool.totalAssets(), 9_804e6);
+        assertEq(pool.reserve(), 1_000e6);
+        assertEq(pool.coveredReserve(), 0);
+    }
+
+    function test_navIsContinuousThroughFloorAndWriteOff() public {
+        lending.setAPR(0);
+        uint256 id = borrow(400e6);
+        vm.warp(getLoan(id).maturity);
+        lending.liquidate(id);
+        uint256 start = block.timestamp;
+        uint256 previous = pool.totalAssets();
+        assertEq(previous, 10_000e6);
+        for (uint256 step = 1; step <= 50; ++step) {
+            vm.warp(start + step * 1 hours);
+            uint256 current = pool.totalAssets();
+            assertLe(current, previous);
+            // The steepest hourly fall is on the Dutch curve itself: 70% of 400 over 24 hours is under 12 per hour.
+            assertLe(previous - current, 12e6);
+            previous = current;
+        }
+        assertEq(pool.totalAssets(), 9_604e6);
+        assertEq(lending.auctionMark(id), 0);
     }
 
     function test_repayDuringAuctionStopsSale() public {

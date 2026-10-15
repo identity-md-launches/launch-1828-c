@@ -38,11 +38,12 @@ contract CardLending is Guarded, ReentrancyGuard {
     struct Book {
         uint256 parHead;
         uint256 descentHead;
-        uint256 floorHead;
+        uint256 decayHead;
         uint256 parDebt;
         uint256 descentDebt;
         uint256 descentWeight;
-        uint256 floorMark;
+        uint256 decayDebt;
+        uint256 decayWeight;
     }
 
     uint256 public constant BPS = 10_000;
@@ -56,7 +57,7 @@ contract CardLending is Guarded, ReentrancyGuard {
     /// @notice Seconds after an auction opens during which its price is still at or above the debt.
     uint256 public constant PAR_WINDOW =
         (AUCTION_START_BPS - BPS) * AUCTION_DURATION / (AUCTION_START_BPS - AUCTION_FLOOR_BPS);
-    /// @notice An auction unsold for this long after reaching its floor is carried at zero in pool NAV.
+    /// @notice An auction unsold at its floor is written down linearly to zero in pool NAV over this long.
     uint256 public constant WRITE_OFF_DELAY = 1 days;
     uint256 public constant INTEREST_DENOMINATOR = BPS * 365 days;
     uint16 public aprBps = 1200;
@@ -82,11 +83,12 @@ contract CardLending is Guarded, ReentrancyGuard {
     uint256[] public auctionQueue;
     uint256 public parHead;
     uint256 public descentHead;
-    uint256 public floorHead;
+    uint256 public decayHead;
     uint256 public parDebt;
     uint256 public descentDebt;
     uint256 public descentWeight;
-    uint256 public floorMark;
+    uint256 public decayDebt;
+    uint256 public decayWeight;
 
     error InvalidAmount();
     error NotBorrower();
@@ -181,12 +183,11 @@ contract CardLending is Guarded, ReentrancyGuard {
     }
 
     /// @notice What the pool carries as receivable, and how much of the frozen debt it expects to lose.
-    /// @dev Auction loans are marked at min(debt, current Dutch price): par for the first `PAR_WINDOW`,
-    /// then down the curve to 50%, and at zero once unsold for `WRITE_OFF_DELAY` past the floor.
+    /// @dev Auction loans are marked at min(debt, current Dutch price): par for the first `PAR_WINDOW`, then
+    /// down the curve to 50% at `AUCTION_DURATION`, then linearly from the floor to zero over `WRITE_OFF_DELAY`.
+    /// The mark is continuous in time, so no lender can time an exit around a step in it.
     function netReceivable() external view returns (uint256 receivable, uint256 expectedShortfall) {
-        uint256 mark = _auctionMark(_projectBook(block.timestamp), block.timestamp);
-        receivable = activePrincipal + _accruedInterest() + mark;
-        expectedShortfall = frozenDebt - mark;
+        return _marks();
     }
 
     /// @notice Current NAV mark of one auction loan; zero once written off or when no auction is open.
@@ -194,8 +195,10 @@ contract CardLending is Guarded, ReentrancyGuard {
         Loan storage l = loans[id];
         if (l.state != State.Auction) return 0;
         uint256 elapsed = block.timestamp - l.auctionStartedAt;
+        if (elapsed < AUCTION_DURATION) return Math.min(l.auctionDebt, auctionPrice(id));
         if (elapsed >= AUCTION_DURATION + WRITE_OFF_DELAY) return 0;
-        return Math.min(l.auctionDebt, auctionPrice(id));
+        uint256 remaining = AUCTION_DURATION + WRITE_OFF_DELAY - elapsed;
+        return Math.ceilDiv(l.auctionDebt * remaining, 2 * WRITE_OFF_DELAY);
     }
 
     /// @notice Anyone may repay in full, including while paused or at auction; the NFT always returns to its borrower.
@@ -204,11 +207,13 @@ contract CardLending is Guarded, ReentrancyGuard {
         if (l.state != State.Active && l.state != State.Auction) revert WrongState();
         uint256 debt = debtOf(id);
         _accrue();
+        (uint256 receivableBefore, uint256 shortfallBefore) = _marks();
         if (l.state == State.Active) _removeActive(l);
         else _removeAuction(l);
         l.state = State.Closed;
         delete collateralLoan[l.tokenId];
-        _payPool(msg.sender, debt, debt);
+        if (debt != 0) usdc.safeTransferFrom(msg.sender, address(this), debt);
+        _settle(debt, debt, receivableBefore, shortfallBefore);
         // transferFrom allows contract borrowers to recover even if their receiver hook later changes.
         nft.transferFrom(address(this), l.borrower, l.tokenId);
         emit Repaid(id, msg.sender, debt);
@@ -227,6 +232,7 @@ contract CardLending is Guarded, ReentrancyGuard {
         if (l.principal > Math.mulDiv(p.price, MAX_LTV_BPS, BPS)) revert TooMuchDebt();
         uint256 interest = interestOf(id);
         _accrue();
+        (uint256 receivableBefore, uint256 shortfallBefore) = _marks();
         interestNumerator -= _loanInterestNumerator(l);
         rateWeight -= l.principal * l.aprBps;
         l.aprBps = aprBps;
@@ -234,7 +240,8 @@ contract CardLending is Guarded, ReentrancyGuard {
         l.startedAt = uint64(block.timestamp);
         l.maturity = uint64(block.timestamp + TERM);
         l.priceIssuedAt = p.issuedAt;
-        _payPool(msg.sender, interest, interest);
+        if (interest != 0) usdc.safeTransferFrom(msg.sender, address(this), interest);
+        _settle(interest, interest, receivableBefore, shortfallBefore);
         emit Extended(id, l.maturity, aprBps, interest);
     }
 
@@ -275,6 +282,7 @@ contract CardLending is Guarded, ReentrancyGuard {
         if (price > maxPrice) revert Slippage();
         Loan storage l = loans[id];
         uint256 debt = l.auctionDebt;
+        (uint256 receivableBefore, uint256 shortfallBefore) = _marks();
         _removeAuction(l);
         l.state = State.Closed;
         delete collateralLoan[l.tokenId];
@@ -285,9 +293,7 @@ contract CardLending is Guarded, ReentrancyGuard {
             totalSurplus += extra;
         }
         usdc.safeTransferFrom(msg.sender, address(this), price);
-        usdc.forceApprove(address(pool), paidToPool);
-        pool.settle(paidToPool, debt);
-        usdc.forceApprove(address(pool), 0);
+        _settle(paidToPool, debt, receivableBefore, shortfallBefore);
         nft.safeTransferFrom(address(this), receiver, l.tokenId);
         emit Purchased(id, msg.sender, receiver, price, extra);
     }
@@ -317,11 +323,19 @@ contract CardLending is Guarded, ReentrancyGuard {
         emit RateSet(next);
     }
 
-    function _payPool(address payer, uint256 payment, uint256 debt) private {
-        if (payment != 0) usdc.safeTransferFrom(payer, address(this), payment);
+    /// @dev Hands `payment` already held here to the pool, telling it exactly how far the book just fell.
+    function _settle(uint256 payment, uint256 debt, uint256 receivableBefore, uint256 shortfallBefore) private {
+        (uint256 receivableAfter, uint256 shortfallAfter) = _marks();
         usdc.forceApprove(address(pool), payment);
-        pool.settle(payment, debt);
+        pool.settle(payment, debt, receivableBefore - receivableAfter, shortfallBefore - shortfallAfter);
         usdc.forceApprove(address(pool), 0);
+    }
+
+    /// @dev Receivable and expected shortfall as the pool reads them, from the book projected to now.
+    function _marks() private view returns (uint256 receivable, uint256 expectedShortfall) {
+        uint256 mark = _auctionMark(_projectBook(block.timestamp), block.timestamp);
+        receivable = activePrincipal + _accruedInterest() + mark;
+        expectedShortfall = frozenDebt - mark;
     }
 
     function _accrue() private {
@@ -355,7 +369,8 @@ contract CardLending is Guarded, ReentrancyGuard {
             descentDebt -= debt;
             descentWeight -= debt * l.auctionStartedAt;
         } else if (elapsed < AUCTION_DURATION + WRITE_OFF_DELAY) {
-            floorMark -= Math.ceilDiv(debt, 2);
+            decayDebt -= debt;
+            decayWeight -= debt * l.auctionStartedAt;
         }
         frozenDebt -= debt;
     }
@@ -364,17 +379,18 @@ contract CardLending is Guarded, ReentrancyGuard {
         Book memory b = _projectBook(block.timestamp);
         parHead = b.parHead;
         descentHead = b.descentHead;
-        floorHead = b.floorHead;
+        decayHead = b.decayHead;
         parDebt = b.parDebt;
         descentDebt = b.descentDebt;
         descentWeight = b.descentWeight;
-        floorMark = b.floorMark;
+        decayDebt = b.decayDebt;
+        decayWeight = b.decayWeight;
     }
 
     /// @dev Advances each head over the entries whose phase ended by `t`. Closed entries are skipped: they were
     /// removed from the aggregates at the phase they were in when they closed, after a sync at that time.
     function _projectBook(uint256 t) private view returns (Book memory b) {
-        b = Book(parHead, descentHead, floorHead, parDebt, descentDebt, descentWeight, floorMark);
+        b = Book(parHead, descentHead, decayHead, parDebt, descentDebt, descentWeight, decayDebt, decayWeight);
         uint256 length = auctionQueue.length;
         while (b.parHead < length) {
             Loan storage l = loans[auctionQueue[b.parHead]];
@@ -392,26 +408,37 @@ contract CardLending is Guarded, ReentrancyGuard {
             if (l.state == State.Auction) {
                 b.descentDebt -= l.auctionDebt;
                 b.descentWeight -= l.auctionDebt * l.auctionStartedAt;
-                b.floorMark += Math.ceilDiv(l.auctionDebt, 2);
+                b.decayDebt += l.auctionDebt;
+                b.decayWeight += l.auctionDebt * l.auctionStartedAt;
             }
             ++b.descentHead;
         }
-        while (b.floorHead < length) {
-            Loan storage l = loans[auctionQueue[b.floorHead]];
+        while (b.decayHead < length) {
+            Loan storage l = loans[auctionQueue[b.decayHead]];
             if (t - l.auctionStartedAt < AUCTION_DURATION + WRITE_OFF_DELAY) break;
-            if (l.state == State.Auction) b.floorMark -= Math.ceilDiv(l.auctionDebt, 2);
-            ++b.floorHead;
+            if (l.state == State.Auction) {
+                b.decayDebt -= l.auctionDebt;
+                b.decayWeight -= l.auctionDebt * l.auctionStartedAt;
+            }
+            ++b.decayHead;
         }
     }
 
-    /// @dev Sum of min(debt, price) over open auctions at `t`, within one base unit per descending auction.
+    /// @dev Sum of the per-loan marks over open auctions at `t`, each phase rounded up once, so the total is within
+    /// one base unit per descending or decaying auction of the sum of `auctionMark` values.
     function _auctionMark(Book memory b, uint256 t) private pure returns (uint256 mark) {
-        mark = b.parDebt + b.floorMark;
+        mark = b.parDebt;
         if (b.descentDebt != 0) {
             uint256 elapsedWeight = t * b.descentDebt - b.descentWeight;
             uint256 numerator = AUCTION_START_BPS * AUCTION_DURATION * b.descentDebt
                 - (AUCTION_START_BPS - AUCTION_FLOOR_BPS) * elapsedWeight;
             mark += Math.ceilDiv(numerator, BPS * AUCTION_DURATION);
+        }
+        if (b.decayDebt != 0) {
+            // Sum of debt * (start + AUCTION_DURATION + WRITE_OFF_DELAY - t) / (2 * WRITE_OFF_DELAY).
+            uint256 remainingWeight =
+                b.decayWeight + (AUCTION_DURATION + WRITE_OFF_DELAY) * b.decayDebt - t * b.decayDebt;
+            mark += Math.ceilDiv(remainingWeight, 2 * WRITE_OFF_DELAY);
         }
     }
 }

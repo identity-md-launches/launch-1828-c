@@ -47,7 +47,9 @@ export function Vault({ p }: { p?: Protocol }) {
 
   const util = p && p.totalAssets > 0n ? Number(((p.totalAssets - p.available) * 10_000n) / p.totalAssets) / 100 : 0;
   const sp = p ? Number(p.sharePrice) / 1e6 : 1;
-  const pts = (hist.data ?? []).filter((x) => x.shares > 0n).map((x) => ({ t: x.t, price: Number(x.assets * 10n ** 12n / x.shares) / 1e6 }));
+  const history = hist.data?.points ?? [];
+  const pts = history.filter((x) => x.shares > 0n).map((x) => ({ t: x.t, price: Number(x.assets * 10n ** 12n / x.shares) / 1e6 }));
+  const realised = hist.data?.complete && hist.data.deposits > 0n ? Number(hist.data.earnings * 1_000_000n / hist.data.deposits) / 10_000 : undefined;
   if (p) pts.push({ t: now, price: sp });
   const book = (loans.data?.loans ?? []).filter((l) => l.state === 1 || l.state === 2);
   const maxW = w.data?.maxWithdraw ?? 0n;
@@ -55,7 +57,7 @@ export function Vault({ p }: { p?: Protocol }) {
   return (
     <>
       <h1>The vault</h1>
-      <p className="lede">Lend AUREON (a test dollar) to the pool. Your share price moves with interest paid and losses taken. No promised APY.</p>
+      <p className="lede">Lend AUREON (a test dollar) to the pool. Share price includes unpaid interest and auction marks. No promised APY.</p>
       {p && (
         <dl className="facts six">
           <div><dt>Total assets</dt><dd><Num src={readSrc("Total assets", "CardPool.totalAssets()", ADDR.pool, [["Rule", "available cash + netReceivable + covered reserve"]])}>{usd(p.totalAssets)}</Num></dd></div>
@@ -63,7 +65,11 @@ export function Vault({ p }: { p?: Protocol }) {
           <div><dt>Reserve</dt><dd><Num src={readSrc("Reserve", "CardPool.reserve()", ADDR.pool, [["Covered", usd(p.covered)]])}>{usd(p.reserve)} · {usd(p.covered)} covered</Num></dd></div>
           <div><dt>Utilisation</dt><dd><Num src={readSrc("Utilisation", "(totalAssets − availableLiquidity) / totalAssets", ADDR.pool)}>{util.toFixed(2)}%</Num></dd></div>
           <div><dt>Share price</dt><dd><Num className="brass" src={readSrc("Share price", "CardPool.convertToAssets(1e12)", ADDR.pool)}>{sp.toFixed(6)}</Num></dd></div>
-          <div><dt>Realised since inception</dt><dd><Num className="brass" src={readSrc("Realised yield", "share price − 1.000000 (initial)", ADDR.pool)}>{((sp - 1) * 100).toFixed(4)}%</Num></dd></div>
+          <div><dt>Share price return</dt><dd><Num className="brass" src={readSrc("Share price return", "share price / initial price (1.000000) − 1", ADDR.pool, [["Includes", "Unpaid accrued interest and current auction marks; not a realised return"]])}>{((sp - 1) * 100).toFixed(4)}%</Num></dd></div>
+          <div><dt>Realised since inception</dt><dd><Num className="brass" src={readSrc("Realised yield", "CardPool.Settled + CardLending.Borrowed/Repaid/Extended/Purchased + CardPool.Deposit events", ADDR.pool,
+            [["Net realised", usd(hist.data?.earnings)], ["Cumulative deposits", usd(hist.data?.deposits)], ["Settlements", hist.data?.settlements ?? "…"],
+              ["Rule", "(settlement cash + reserve used − reserve held back − principal closed) / cumulative deposited assets"],
+              ["Basis", "Pool-wide cash-flow return since deployment; not annualised or an individual lender return. Unpaid receivables and borrower surplus excluded."]])}>{realised === undefined ? "…" : `${realised.toFixed(4)}%`}</Num></dd></div>
         </dl>
       )}
       <ShareChart pts={pts} />
@@ -113,7 +119,7 @@ export function Vault({ p }: { p?: Protocol }) {
           </section>
         );
       })}
-      {hist.data && hist.data.length > 0 && <p className="fine">Last pool event {hist.data[hist.data.length - 1].t ? dateTime(hist.data[hist.data.length - 1].t!) : ""}.</p>}
+      {history.length > 0 && <p className="fine">Last pool event {history[history.length - 1].t ? dateTime(history[history.length - 1].t!) : ""}.</p>}
     </>
   );
 }

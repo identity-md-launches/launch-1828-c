@@ -1,13 +1,10 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { getAddress, type Address, type Hex } from "viem";
+import { decodeFunctionData, getAddress, type Address, type Hex } from "viem";
 import { ADDR } from "./config";
 import { client, scanLogs, blockTime } from "./chain";
-import { CardOracleAbi } from "./abi/CardOracle";
-import { CardLendingAbi } from "./abi/CardLending";
-import { CardPoolAbi } from "./abi/CardPool";
-import { MockCardNFTAbi } from "./abi/MockCardNFT";
-import { MockUSDCAbi } from "./abi/MockUSDC";
+import { CardOracleReadAbi as CardOracleAbi, CardLendingReadAbi as CardLendingAbi, CardPoolReadAbi as CardPoolAbi,
+  MockCardNFTReadAbi as MockCardNFTAbi, MockUSDCReadAbi as MockUSDCAbi } from "./abi/reads";
 import { imdAbi } from "./abi/erc20";
 
 const safe = async <T,>(p: Promise<T>): Promise<T | undefined> => {
@@ -16,12 +13,43 @@ const safe = async <T,>(p: Promise<T>): Promise<T | undefined> => {
 
 export type Template = { cardName: string; cardNumber: string; setName: string; setSlug: string; cardSlug: string; gradeColumn: string };
 export type Price = { price: bigint; issuedAt: bigint; expiresAt: bigint };
-export type Stored = { classId: Hex; oracleId: Hex; price: bigint; issuedAt: bigint; expiresAt: bigint; tx: Hex; block: bigint };
+export type Stored = {
+  classId: Hex; oracleId: Hex; price: bigint; issuedAt: bigint; expiresAt: bigint; tx: Hex; block: bigint;
+  signer?: Address; intakeId?: Hex; panelSize?: number; quorum?: number; agreed?: number;
+};
 export type ClassRow = {
   classId: Hex; version: number; template: Template; fresh?: Price; last?: Price; pending: Hex;
   stored?: Stored; history: OracleEvent[];
 };
 export type OracleEvent = { kind: "Requested" | "PriceStored" | "Failed" | "TimedOut"; classId?: Hex; intakeId?: Hex; tx: Hex; block: bigint; detail: string; stored?: Stored };
+
+const attestationCache = new Map<string, Promise<{ panelSize?: number; quorum?: number; agreed?: number }>>();
+/** Matching successful submit/onPrice calldata is the signed message, not today's oracle settings. */
+function attestationPanel(s: Stored) {
+  const key = `${s.tx}:${s.oracleId}`;
+  let hit = attestationCache.get(key);
+  if (!hit) {
+    hit = (async () => {
+      const tx = await client.getTransaction({ hash: s.tx });
+      if (tx.to && getAddress(tx.to) === ADDR.oracle) {
+        const decoded = decodeFunctionData({ abi: CardOracleAbi, data: tx.input });
+        const a = decoded.functionName === "submit" ? decoded.args[0] : decoded.functionName === "onPrice" ? decoded.args[1] : undefined;
+        if (a && a.requestId === s.oracleId && a.issuedAt === s.issuedAt && a.expiresAt === s.expiresAt && BigInt(a.answer) * 1_000_000n === s.price) {
+          return { panelSize: a.panelSize, quorum: a.quorum, agreed: a.agreed };
+        }
+      }
+      // An internal Intake callback need not expose onPrice as top-level calldata. Its immutable
+      // request snapshot still proves the minimum agreement required when this price was accepted.
+      if (s.intakeId) {
+        const r = await client.readContract({ address: ADDR.oracle, abi: CardOracleAbi, functionName: "request", args: [s.intakeId] });
+        return { panelSize: r.panelSize, quorum: r.quorum };
+      }
+      return {};
+    })().catch(() => { attestationCache.delete(key); return {}; });
+    attestationCache.set(key, hit);
+  }
+  return hit;
+}
 
 /** Seconds since epoch, ticking. */
 export function useNow(ms = 1000) {
@@ -66,22 +94,30 @@ export function useProtocol() {
       const intakeClass = new Map<Hex, Hex>();
       const events: OracleEvent[] = [];
       const storedBy = new Map<Hex, Stored>();
+      const requestByClass = new Map<Hex, Hex>();
+      let acceptedSigner: Address | undefined;
       for (const e of scan.logs) {
         const a = e.args as Record<string, any>;
         const tx = e.transactionHash as Hex, block = e.blockNumber as bigint;
+        // OracleSignerSet is emitted in the constructor and on every rotation. Replay in log order
+        // to capture the verification signer at each PriceStored, including same-block rotations.
+        if (e.eventName === "OracleSignerSet") acceptedSigner = getAddress(a.signer);
         if (e.eventName === "ClassSet") latest.set(a.classId, { version: Number(a.version), enabled: a.enabled });
         if (e.eventName === "Requested") {
           intakeClass.set(a.intakeId, a.classId);
+          requestByClass.set(a.classId, a.intakeId);
           events.push({ kind: "Requested", classId: a.classId, intakeId: a.intakeId, tx, block, detail: `requested by ${a.payer}` });
         }
         if (e.eventName === "PriceStored") {
-          const s: Stored = { classId: a.classId, oracleId: a.oracleId, price: a.price, issuedAt: a.issuedAt, expiresAt: a.expiresAt, tx, block };
+          const s: Stored = { classId: a.classId, oracleId: a.oracleId, price: a.price, issuedAt: a.issuedAt, expiresAt: a.expiresAt, tx, block,
+            signer: acceptedSigner, intakeId: requestByClass.get(a.classId) };
           storedBy.set(a.classId, s);
           events.push({ kind: "PriceStored", classId: a.classId, tx, block, detail: "", stored: s });
         }
         if (e.eventName === "Failed") events.push({ kind: "Failed", intakeId: a.intakeId, classId: intakeClass.get(a.intakeId), tx, block, detail: `${a.agreed} of ${a.answered} agreed, status ${a.status}` });
         if (e.eventName === "TimedOut") events.push({ kind: "TimedOut", intakeId: a.intakeId, classId: intakeClass.get(a.intakeId), tx, block, detail: "no answer within two days" });
       }
+      await Promise.all(events.filter((e) => e.stored).map(async (e) => Object.assign(e.stored!, await attestationPanel(e.stored!))));
       const ids = [...latest].filter(([, v]) => v.enabled).map(([k]) => k);
       const classes: ClassRow[] = await Promise.all(ids.map(async (classId) => {
         const [template, fresh, last, pending] = await Promise.all([
@@ -149,20 +185,42 @@ export function useLoans(nextLoanId: bigint | undefined) {
   });
 }
 
-/** Pool events: share price history from ERC-4626 Deposit and Withdraw. */
+/** Cash-flow return, excluding unpaid interest: settlement cash + reserve used − reserve held
+ * back − principal closed, divided by cumulative ERC-4626 deposits (not annualised). */
 export function usePoolHistory() {
   return useQuery({
     queryKey: ["poolHistory"],
     refetchInterval: 60_000,
     queryFn: async () => {
-      const { logs } = await scanLogs(ADDR.pool, CardPoolAbi);
+      const [poolEvents, lendingEvents] = await Promise.all([
+        scanLogs(ADDR.pool, CardPoolAbi), scanLogs(ADDR.lending, CardLendingAbi),
+      ]);
+      const logs = [...poolEvents.logs, ...lendingEvents.logs].sort((a, b) =>
+        a.blockNumber === b.blockNumber ? Number(a.logIndex) - Number(b.logIndex) : a.blockNumber! < b.blockNumber! ? -1 : 1);
       const pts: { block: bigint; t?: number; kind: string; assets: bigint; shares: bigint }[] = [];
+      const principals = new Map<bigint, bigint>();
+      const pending = new Map<Hex, { payment: bigint; reserveUsed: bigint; heldBack: bigint }[]>();
+      let deposits = 0n, earnings = 0n, settlements = 0, incomplete = false;
       for (const e of logs) {
         const a = e.args as Record<string, any>;
         if (e.eventName === "Deposit" || e.eventName === "Withdraw") pts.push({ block: e.blockNumber as bigint, kind: e.eventName, assets: a.assets, shares: a.shares });
+        if (e.eventName === "Deposit") deposits += a.assets;
+        if (e.eventName === "Borrowed") principals.set(a.loanId, a.principal);
+        if (e.eventName === "Settled") {
+          const queue = pending.get(e.transactionHash!) ?? [];
+          queue.push({ payment: a.payment, reserveUsed: a.reserveUsed, heldBack: a.heldBack }); pending.set(e.transactionHash!, queue);
+        }
+        if (e.eventName === "Extended" || e.eventName === "Repaid" || e.eventName === "Purchased") {
+          const cash = pending.get(e.transactionHash!)?.shift();
+          const principal = e.eventName === "Extended" ? 0n : principals.get(a.loanId);
+          if (!cash || principal === undefined) { incomplete = true; continue; }
+          earnings += cash.payment + cash.reserveUsed - cash.heldBack - principal;
+          settlements++;
+        }
       }
+      if ([...pending.values()].some((q) => q.length)) incomplete = true;
       await Promise.all(pts.slice(-40).map(async (p) => { p.t = await safe(blockTime(p.block)); }));
-      return pts;
+      return { points: pts, earnings, deposits, settlements, complete: !incomplete };
     },
   });
 }

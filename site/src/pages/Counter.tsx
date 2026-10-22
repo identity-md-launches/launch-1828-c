@@ -2,9 +2,9 @@ import { useState } from "react";
 import type { Hex } from "viem";
 import { useAccount } from "wagmi";
 import { ADDR } from "../config";
-import { age, usd } from "../format";
+import { usd } from "../format";
 import { useLoans, useNow, type Protocol } from "../data";
-import { Num, Slab, readSrc } from "../ui";
+import { Num, PriceTag, Slab, readSrc } from "../ui";
 import { Quote } from "../Quote";
 import { askConnect } from "../Wallet";
 
@@ -31,21 +31,25 @@ export function Counter({ p }: { p?: Protocol }) {
       </div>
       {!p && <p className="empty">Reading the counter from Sepolia…</p>}
       {p && p.classes.length === 0 && (
-        <p className="empty">No cards listed at the counter yet. The owner lists a card class with CardOracle.setClass; it shows here as soon as it does.</p>
+        <p className="empty counter-empty">No card classes listed yet.</p>
       )}
       {p && cls && (
         <div className="counter">
-          <div className="slabs" role="list" aria-label="Listed cards">
-            {p.classes.map((c) => (
-              <div role="listitem" key={c.classId}>
-                <Slab template={c.template} grey={!c.fresh} selected={c.classId === cls.classId} onClick={() => setSel(c.classId)}
-                  badge={c.fresh ? <span className="mono">{usd(c.fresh.price)}</span> : <span>No fresh price</span>} />
-              </div>
-            ))}
-          </div>
+          <Slab template={cls.template} grey={!cls.fresh} selected />
           <Quote cls={cls} p={p} now={now}>
             {cls.fresh && <button type="button" className="primary" onClick={open}>Open a ticket</button>}
           </Quote>
+          {p.classes.length > 1 && <section className="catalog" aria-label="Choose another card">
+            <h2>Other cards</h2>
+            <div className="slabs" role="list" aria-label="Listed cards">
+            {p.classes.filter((c) => c.classId !== cls.classId).map((c) => (
+              <div role="listitem" key={c.classId}>
+                <Slab template={c.template} grey={!c.fresh} onClick={() => setSel(c.classId)}
+                  badge={<span>{c.fresh ? "Get a quote" : "No fresh price"}</span>} />
+              </div>
+            ))}
+            </div>
+          </section>}
         </div>
       )}
       {p && (
@@ -53,7 +57,7 @@ export function Counter({ p }: { p?: Protocol }) {
           <div><dt>Pool size</dt><dd><Num src={readSrc("Pool size", "CardPool.totalAssets()", ADDR.pool)}>{usd(p.totalAssets)}</Num></dd></div>
           <div><dt>Cards in custody</dt><dd><Num src={readSrc("Cards in custody", "CardLending.loan(1..nextLoanId-1), state Active or Auction", ADDR.lending)}>{custody ?? "…"}</Num></dd></div>
           <div><dt>Last price</dt><dd>{last ? (
-            <Num src={readSrc("Last price", "CardOracle PriceStored event", ADDR.oracle, [["Issued", `${age(now - Number(last.issuedAt))} ago`]])}>{usd(last.price)} · {age(now - Number(last.issuedAt))} ago</Num>
+            <PriceTag price={last} stored={last} now={now} classId={last.classId} compact stale={BigInt(p.now) > last.expiresAt || p.now - Number(last.issuedAt) > 86_400} />
           ) : <span className="mono">None yet</span>}</dd></div>
         </dl>
       )}

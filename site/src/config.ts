@@ -1,5 +1,5 @@
 import { createConfig, http } from "wagmi";
-import { coinbaseWallet, injected, walletConnect } from "wagmi/connectors";
+import { injected } from "wagmi/connectors";
 import { defineChain, getAddress, type Address } from "viem";
 
 const env = import.meta.env;
@@ -57,14 +57,16 @@ export const walletConnectProjectId = (env.VITE_WALLETCONNECT_PROJECT_ID as stri
 
 export const wagmiConfig = createConfig({
   chains: [chain],
+  // Restore persisted accounts after the prerendered disconnected shell has hydrated.
+  ssr: true,
   multiInjectedProviderDiscovery: true,
-  connectors: [
-    injected(),
-    ...(walletConnectProjectId
-      ? [walletConnect({ projectId: walletConnectProjectId, showQrModal: true,
-          metadata: { name: SITE_NAME, description: SITE_DESCRIPTION, url: SITE_URL, icons: [SITE_ICON_URL] } })]
-      : []),
-    coinbaseWallet({ appName: SITE_NAME }),
-  ],
+  // Public reads and injected discovery need no wallet SDK. Load optional connectors on Connect.
+  connectors: [injected()],
   transports: { [chain.id]: http(RPCS[0]) },
 });
+
+let walletLoad: Promise<void> | undefined;
+export function loadWallets() {
+  return walletLoad ??= import("./wallet-connectors").then(({ registerWallets }) => registerWallets())
+    .catch((error) => { walletLoad = undefined; throw error; });
+}

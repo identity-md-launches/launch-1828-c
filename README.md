@@ -150,3 +150,10 @@ This is a testnet prototype, **not an audited production lending system**. The p
 The CardVault site lives in [`site/`](site/README.md): a static Vite + React export in `site/dist/`, with
 install, preview, rebuild, env and e2e instructions in `site/README.md`. Design tokens and components are in
 [`DESIGN.md`](DESIGN.md).
+
+## Static web app
+
+The CardVault frontend lives in `site/`, with its production export at repository-root `dist/`.
+See [site/README.md](site/README.md) for setup, preview, build-time addresses and Anvil interaction tests,
+[DESIGN.md](DESIGN.md) for the implemented interface, and [site/VALIDATION.md](site/VALIDATION.md)
+for the revision checks. The web revision leaves contract source, Foundry configuration and dependencies unchanged.

@@ -1,18 +1,26 @@
-import { createPublicClient, fallback, http, parseEventLogs, type Abi, type Address, type Hex } from "viem";
+import { createClient, fallback, http, parseEventLogs, type Abi, type Address, type Hex, type PublicActions, type Transport } from "viem";
+import { getBlock, getBlockNumber, getLogs, getTransaction, readContract } from "viem/actions";
 import { chain, FROM_BLOCK, PUBLIC_RPC_URLS } from "./config";
 
 // Reads go over the public RPCs; viem batches concurrent reads into Multicall3 aggregate calls.
-export const client = createPublicClient({
+export const client = createClient({
   chain,
   transport: fallback(PUBLIC_RPC_URLS.map((u) => http(u, { batch: { batchSize: 20 }, retryCount: 1 }))),
   batch: { multicall: { wait: 16, batchSize: 4096 } },
-});
+}).extend((c) => ({
+  getBlock: (args = {}) => getBlock(c, args),
+  getBlockNumber: (args = {}) => getBlockNumber(c, args),
+  getLogs: ((args) => getLogs(c, args)) as PublicActions<Transport, typeof chain>["getLogs"],
+  getTransaction: (args) => getTransaction(c, args),
+  readContract: (args) => readContract(c, args),
+} satisfies Pick<PublicActions<Transport, typeof chain>, "getBlock" | "getBlockNumber" | "getLogs" | "getTransaction" | "readContract">));
 
 const CHUNK = 9_999n;
 
 /** Every log of one contract since deployment, decoded against its ABI. Scanned in parallel chunks. */
 export async function scanLogs<const A extends Abi>(address: Address, abi: A) {
-  const head = await client.getBlockNumber();
+  // State reads after a receipt are latest; scan through that same head, not a cached pre-write head.
+  const head = await client.getBlockNumber({ cacheTime: 0 });
   const ranges: [bigint, bigint][] = [];
   for (let from = FROM_BLOCK; from <= head; from += CHUNK + 1n) ranges.push([from, from + CHUNK > head ? head : from + CHUNK]);
   const parts = await Promise.all(

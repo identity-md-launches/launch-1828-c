@@ -2,8 +2,9 @@ import { useEffect, useState } from "react";
 import { useAccount, useConnect, useDisconnect, useSwitchChain, type Connector } from "wagmi";
 import { WALLET_ICONS } from "./wallet-icons";
 import { OPEN_IN, isMobileBrowser } from "./open-in";
-import { CHAIN_ID, WALLET_ADD_CHAIN } from "./config";
+import { CHAIN_ID, WALLET_ADD_CHAIN, loadWallets } from "./config";
 import { short } from "./format";
+import { Drawer } from "./ui";
 
 const svg = (s: string) => `data:image/svg+xml;utf8,${encodeURIComponent(s)}`;
 
@@ -28,6 +29,8 @@ export function ConnectSheet() {
   const { switchChainAsync } = useSwitchChain();
   const [open, setOpen] = useState(false);
   const [menu, setMenu] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   useEffect(() => {
     const o = () => setOpen(true);
     addEventListener("cv-connect", o);
@@ -35,9 +38,11 @@ export function ConnectSheet() {
   }, []);
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setOpen(false); };
-    addEventListener("keydown", onKey);
-    return () => removeEventListener("keydown", onKey);
+    let active = true;
+    setLoading(true); setLoadError(false);
+    loadWallets().catch(() => { if (active) setLoadError(true); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
   }, [open]);
   useEffect(() => { if (isConnected) setOpen(false); }, [isConnected]);
 
@@ -60,9 +65,7 @@ export function ConnectSheet() {
     <>
       <button type="button" className="cta" onClick={() => setOpen(true)}>Connect</button>
       {open && (
-        <div className="sheet-bg" onClick={() => setOpen(false)}>
-          <div className="sheet" role="dialog" aria-modal="true" aria-label="Connect a wallet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-head"><h2>Connect a wallet</h2><button type="button" className="x" aria-label="Close" onClick={() => setOpen(false)}>×</button></div>
+        <Drawer title="Connect a wallet" onClose={() => setOpen(false)}>
             {mobile && OPEN_IN.map((w) => (
               <a key={w.id} className="row" href={w.href(location.href)}>
                 <span className="ic"><img width={28} height={28} src={svg(WALLET_ICONS[w.id]!)} alt="" /></span>
@@ -76,8 +79,9 @@ export function ConnectSheet() {
               </button>
             ))}
             {error && <p className="txnote err">{/rejected|denied/i.test(error.message) ? "You closed the wallet prompt. Pick a wallet to try again." : error.message.split("\n")[0]}</p>}
-          </div>
-        </div>
+            {loading && <p className="fine" role="status">Loading more wallets…</p>}
+            {loadError && <p className="err" role="status">Could not load more wallets. Close Connect and try again.</p>}
+        </Drawer>
       )}
     </>
   );

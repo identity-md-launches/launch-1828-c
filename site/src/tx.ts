@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useAccount, useWriteContract } from "wagmi";
 import { BaseError, ContractFunctionRevertedError, type Abi, type Address } from "viem";
+import { simulateContract, waitForTransactionReceipt } from "viem/actions";
 import { client } from "./chain";
 import { CHAIN_ID } from "./config";
 
@@ -56,9 +57,9 @@ export function useTx() {
     try {
       for (const s of steps) {
         setBusy(s.label);
-        await client.simulateContract({ account: address, address: s.address, abi: s.abi, functionName: s.functionName, args: s.args } as any);
+        await simulateContract(client, { account: address, address: s.address, abi: s.abi, functionName: s.functionName, args: s.args } as any);
         const hash = await writeContractAsync({ address: s.address, abi: s.abi, functionName: s.functionName, args: s.args } as any);
-        const r = await client.waitForTransactionReceipt({ hash });
+        const r = await waitForTransactionReceipt(client, { hash });
         if (r.status !== "success") throw new Error(`${s.label} reverted.`);
       }
       setDone(doneText);

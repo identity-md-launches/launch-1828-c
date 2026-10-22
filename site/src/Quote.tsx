@@ -2,10 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { ADDR } from "./config";
 import { date, maxBorrow, pct, quote, TERM, usd } from "./format";
 import type { ClassRow, Protocol } from "./data";
-import { Num, PriceTag, readSrc } from "./ui";
+import { Num, PriceTag, readSrc, useUi } from "./ui";
 
 /** Attested price, borrow limit, amount slider and the full cost of a 30-day ticket. */
 export function Quote({ cls, p, now, children, onAmount }: { cls: ClassRow; p: Protocol; now: number; children?: ReactNode; onAmount?: (a: bigint) => void }) {
+  const { openDesk } = useUi();
   const limit = cls.fresh ? maxBorrow(cls.fresh.price) : 0n;
   const [share, setShare] = useState(100);
   useEffect(() => setShare(100), [cls.classId]);
@@ -16,7 +17,8 @@ export function Quote({ cls, p, now, children, onAmount }: { cls: ClassRow; p: P
   const costPct = amount > 0n ? Number((q.cost * 1_000_000n) / amount) / 10_000 : 0;
   return (
     <section className="quote" aria-label="Quote">
-      <PriceTag price={cls.fresh} stored={cls.stored} panelSize={p.panelSize} quorum={p.quorum} signer={p.signer} now={now} classId={cls.classId} />
+      <PriceTag price={cls.fresh ?? cls.last} stale={!cls.fresh} stored={cls.stored} now={now} classId={cls.classId} />
+      {!cls.fresh && cls.last && cls.last.issuedAt > 0n && <p className="fine">No price in the last 24h. <button type="button" className="link" onClick={() => openDesk(cls.classId)}>Request one (0.5 IMD).</button></p>}
       {cls.fresh && (
         <>
           <div className="q-limit">

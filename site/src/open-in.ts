@@ -14,4 +14,4 @@ export const OPEN_IN: ReadonlyArray<{ id: string; name: string; href: (url: stri
 ];
 
 /** A phone or tablet browser with no injected provider is the case the links exist for. */
-export const isMobileBrowser = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) && !(window as any).ethereum;
+export const isMobileBrowser = () => typeof window !== "undefined" && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) && !(window as any).ethereum;

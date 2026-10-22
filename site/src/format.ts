@@ -13,11 +13,6 @@ export function usd(v: bigint | undefined, opts: { sign?: boolean } = {}): strin
   const frac = (cents % 100n).toString().padStart(2, "0");
   return `${neg ? "-" : opts.sign ? "+" : ""}$${whole}.${frac}`;
 }
-/** Ticking amounts get six places so the accrual is visible. */
-export function usd6(v: bigint): string {
-  const whole = (v / 1_000_000n).toLocaleString("en-US");
-  return `$${whole}.${(v % 1_000_000n).toString().padStart(6, "0")}`;
-}
 export const pct = (bps: number | bigint, digits = 2) => `${(Number(bps) / 100).toFixed(digits)}%`;
 export function parseUsd(s: string): bigint | undefined {
   const m = s.trim().replace(/[$,]/g, "").match(/^(\d*)(?:\.(\d{0,6}))?$/);

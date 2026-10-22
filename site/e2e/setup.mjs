@@ -13,9 +13,9 @@ export const RPC = "http://127.0.0.1:8547";
 export const KEYS = [
   "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
 ];
-const art = (n) => JSON.parse(readFileSync(join(ROOT, `out/${n}.sol/${n}.json`), "utf8"));
+const art = (n) => JSON.parse(readFileSync(join(ROOT, `out/${["TestIMD", "MockIntake"].includes(n) ? "Mocks" : n}.sol/${n}.json`), "utf8"));
 const chain = defineChain({ id: 11155111, name: "anvil-sepolia", nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [RPC] } } });
-const pub = createPublicClient({ chain, transport: http(RPC) });
+const pub = createPublicClient({ chain, transport: http(RPC), pollingInterval: 50, cacheTime: 0 });
 const rpc = (method, params = []) => fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }).then((r) => r.json());
 
 export default async function globalSetup() {
@@ -40,11 +40,12 @@ export default async function globalSetup() {
   const usdc = await deploy("MockUSDC", [owner.address]);
   const nft = await deploy("MockCardNFT", [owner.address]);
   const pool = await deploy("CardPool", [owner.address, usdc]);
-  // Intake and IMD are placeholders on anvil: price requests are not exercised, the price is written directly.
-  const oracle = await deploy("CardOracle", [owner.address, buyer.address, buyer.address, owner.address]);
+  const imd = await deploy("TestIMD", []);
+  const intake = await deploy("MockIntake", []);
+  const oracle = await deploy("CardOracle", [owner.address, intake, imd, owner.address]);
   const lending = await deploy("CardLending", [owner.address, nft, pool, oracle, usdc]);
   await send(pool, "CardPool", "setLending", [lending]);
-  const card = (cert) => ({ game: "Pokemon", set: "Base Set", cardName: "Charizard", cardNumber: "4", grader: "PSA", grade: "9", certNumber: cert });
+  const card = (cert, cardName = "Charizard", cardNumber = "4") => ({ game: "Pokemon", set: "Base Set", cardName, cardNumber, grader: "PSA", grade: "9", certNumber: cert });
   const classId = await pub.readContract({ address: nft, abi: art("MockCardNFT").abi, functionName: "computeClassId", args: [card("1")] });
   await send(oracle, "CardOracle", "setClass", [classId, { cardName: "Charizard", cardNumber: "4", setName: "Pokemon Base Set", setSlug: "pokemon-base-set", cardSlug: "charizard-4", gradeColumn: "PSA 9" }, true]);
   for (const cert of ["80011001", "80011002"]) await send(nft, "MockCardNFT", "mint", [borrower.address, card(cert)]);
@@ -53,15 +54,28 @@ export default async function globalSetup() {
   await send(usdc, "MockUSDC", "mint", [buyer.address, 50_000n * 10n ** 6n]);
   await send(usdc, "MockUSDC", "approve", [pool, 100_000n * 10n ** 6n]);
   await send(pool, "CardPool", "deposit", [100_000n * 10n ** 6n, owner.address]);
-  // prices[classId] lives at mapping slot 16: {price}, {issuedAt | expiresAt << 64}.
-  const now = BigInt((await pub.getBlock()).timestamp);
-  const base = BigInt(keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }], [classId, 16n])));
-  const issued = now - 60n, expires = issued + 86_400n;
-  await rpc("anvil_setStorageAt", [oracle, pad(toHex(base)), pad(toHex(2_000n * 10n ** 6n))]);
-  await rpc("anvil_setStorageAt", [oracle, pad(toHex(base + 1n)), pad(toHex(issued | (expires << 64n)))]);
-  await rpc("evm_mine", []);
+  // Real request records and EIP-712 verification, signed only by anvil's public synthetic account.
+  await send(imd, "TestIMD", "mint", [owner.address, 2n * 10n ** 18n]);
+  await send(imd, "TestIMD", "approve", [oracle, 2n * 10n ** 18n]);
+  const classes = [];
+  for (const [i, name, number, dollars] of [[1, "Charizard", "4", 2000], [2, "Blastoise", "2", 1500], [3, "Venusaur", "15", 1000]]) {
+    const id = await pub.readContract({ address: nft, abi: art("MockCardNFT").abi, functionName: "computeClassId", args: [card("1", name, number)] });
+    if (id !== classId) await send(oracle, "CardOracle", "setClass", [id, { cardName: name, cardNumber: number, setName: "Pokemon Base Set", setSlug: "pokemon-base-set", cardSlug: `${name.toLowerCase()}-${number}`, gradeColumn: "PSA 9" }, true]);
+    await send(oracle, "CardOracle", "requestPrice", [id]);
+    const intakeId = await pub.readContract({ address: oracle, abi: art("CardOracle").abi, functionName: "pendingForClass", args: [id] });
+    const requestId = pad(toHex(i, { size: 16 }), { size: 32, dir: "right" });
+    const questionHash = keccak256(toHex(`synthetic question ${i}`));
+    await send(oracle, "CardOracle", "bindRelay", [intakeId, requestId, questionHash]);
+    const block = await pub.getBlock();
+    const a = { requestId, chainId: 1n, questionHash, answerType: 3, answer: encodeAbiParameters([{ type: "uint256" }], [BigInt(dollars)]), figure: BigInt(dollars), fromBlock: 1n, toBlock: block.number, blockHash: block.hash, panelJobId: requestId, panelSize: 30, quorum: 21, agreed: 21, issuedAt: block.timestamp, expiresAt: block.timestamp + 86_400n };
+    const digest = await pub.readContract({ address: oracle, abi: art("CardOracle").abi, functionName: "attestationDigest", args: [a] });
+    await send(oracle, "CardOracle", "submit", [a, await owner.sign({ hash: digest })]);
+    classes.push(id);
+  }
+  // Rotation must never change attribution of the already stored attestations.
+  await send(oracle, "CardOracle", "setSigner", [buyer.address]);
 
-  const outDir = join(SITE, "e2e/.dist");
+  const outDir = join(ROOT, "test/scratch/e2e-dist");
   execSync("npx vite build", {
     cwd: SITE, stdio: "ignore",
     env: { ...process.env, CV_OUT_DIR: outDir, VITE_RPC_URLS: RPC, VITE_FROM_BLOCK: "0", VITE_MOCK_USDC: usdc, VITE_MOCK_CARD_NFT: nft, VITE_CARD_POOL: pool, VITE_CARD_ORACLE: oracle, VITE_CARD_LENDING: lending },
@@ -73,6 +87,7 @@ export default async function globalSetup() {
     try { res.writeHead(200, { "content-type": types[extname(file)] ?? "application/octet-stream" }); res.end(readFileSync(file)); }
     catch { res.writeHead(404); res.end(); }
   }).listen(4318);
-  writeFileSync(join(import.meta.dirname, ".state.json"), JSON.stringify({ borrower: b, lender: l, buyer: u, usdc, nft, pool, oracle, lending, classId }, null, 2));
+  const snapshot = (await rpc("evm_snapshot")).result;
+  writeFileSync(join(ROOT, "test/scratch/e2e-state.json"), JSON.stringify({ snapshot, borrower: b, lender: l, buyer: u, owner: owner.address, usdc, nft, pool, oracle, lending, imd, intake, classId, classes }, null, 2));
   return async () => { server.close(); anvil.kill(); };
 }

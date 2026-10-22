@@ -1,4 +1,5 @@
 import { createContext, useContext, useEffect, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { Hex } from "viem";
 import { ADDR, EXPLORER, ORACLE_API, ORACLE_EXPLORER } from "./config";
 import { oracleUuid } from "./chain";
@@ -80,8 +81,8 @@ export function Stamp({ text, tone = "red", land }: { text: string; tone?: "red"
 }
 
 /** The price tag: never a price without where it came from. */
-export function PriceTag({ price, stored, panelSize, quorum, signer, now, classId }: {
-  price?: Price; stored?: Stored; panelSize: number; quorum: number; signer: string; now: number; classId: Hex;
+export function PriceTag({ price, stored, now, classId, compact = false, stale = false }: {
+  price?: Price; stored?: Stored; now: number; classId: Hex; compact?: boolean; stale?: boolean;
 }) {
   const { openDesk, showSource } = useUi();
   if (!price || price.issuedAt === 0n) {
@@ -91,39 +92,48 @@ export function PriceTag({ price, stored, panelSize, quorum, signer, now, classI
       </div>
     );
   }
-  const uuid = stored ? oracleUuid(stored.oracleId) : undefined;
+  // A stored event belongs to this exact price. Never attach an earlier class version's receipt.
+  const receipt = stored?.price === price.price && stored.issuedAt === price.issuedAt && stored.expiresAt === price.expiresAt ? stored : undefined;
+  const uuid = receipt ? oracleUuid(receipt.oracleId) : undefined;
+  const signer = receipt?.signer;
+  const panel = receipt?.agreed !== undefined ? `${receipt.agreed} of ${receipt.panelSize} agreed`
+    : receipt?.quorum !== undefined ? `At least ${receipt.quorum} agreed · panel ≥${receipt.panelSize}` : "See attestation for agreement";
+  const old = stale || BigInt(now) > price.expiresAt || now - Number(price.issuedAt) > 86_400;
   const src: Source = {
     title: "Attested price",
     lines: [
       ["Price", usd(price.price)],
       ["Issued", dateTime(price.issuedAt)],
       ["Expires", dateTime(price.expiresAt)],
-      ["Panel", `${quorum} of ${panelSize} agreed (quorum)`],
-      ["Signer", <a key="s" href={addrLink(signer)} target="_blank" rel="noreferrer">{short(signer)}</a>],
-      ["Read", <code key="r">CardOracle.freshPrice(classId)</code>],
-      ...(stored ? [["Oracle id", <code key="o">{short(stored.oracleId)}</code>] as [string, ReactNode]] : []),
+      ["Status", old ? "Stale · request a new price before borrowing" : "Fresh"],
+      ["Panel", panel],
+      ["Signer", signer ? <a key="s" href={addrLink(signer)} target="_blank" rel="noreferrer">{short(signer)}</a> : "Unavailable in scanned history"],
+      ["Signer source", "OracleSignerSet event preceding this PriceStored (verification signer at acceptance)"],
+      ["Read", <code key="r">CardOracle.prices(classId), PriceStored event</code>],
+      ...(receipt ? [["Oracle id", <code key="o">{short(receipt.oracleId)}</code>] as [string, ReactNode]] : []),
     ],
     links: [
       ["IdentityMD oracle explorer", ORACLE_EXPLORER],
       ...(uuid ? [[`Attestation ${uuid.slice(0, 8)}`, `${ORACLE_API}/${uuid}`] as [string, string]] : []),
-      ...(stored ? [["PriceStored transaction", txLink(stored.tx)] as [string, string]] : []),
+      ...(receipt ? [["PriceStored transaction", txLink(receipt.tx)] as [string, string]] : []),
       ["CardOracle contract", addrLink(ADDR.oracle)],
     ],
   };
   return (
-    <div className="tag">
-      <button type="button" className="tag-price num" onClick={() => showSource(src)} aria-label="Attested price: where it came from">{usd(price.price)}</button>
-      <dl className="tag-rows">
+    <div className={`tag${compact ? " compact" : ""}${old ? " stale" : ""}`}>
+      <button type="button" className="tag-price num" onClick={() => showSource(src)} aria-label={`Attested price ${usd(price.price)}: where it came from`}>{usd(price.price)}{old && <span className="stale-label"> · stale</span>}</button>
+      {compact && <span className="tag-age mono"> · {age(now - Number(price.issuedAt))} ago</span>}
+      {!compact && <><dl className="tag-rows">
         <div><dt>Issued</dt><dd className="mono">{dateTime(price.issuedAt)} · {age(now - Number(price.issuedAt))} ago</dd></div>
         <div><dt>Expires</dt><dd className="mono">{dateTime(price.expiresAt)}</dd></div>
-        <div><dt>Panel</dt><dd className="mono">{quorum} of {panelSize} agreed</dd></div>
-        <div><dt>Signer</dt><dd className="mono"><a href={addrLink(signer)} target="_blank" rel="noreferrer">{short(signer)}</a></dd></div>
+        <div><dt>Panel</dt><dd className="mono">{panel}</dd></div>
+        <div><dt>Signer</dt><dd className="mono">{signer ? <a href={addrLink(signer)} target="_blank" rel="noreferrer">{short(signer)}</a> : "See attestation"}</dd></div>
       </dl>
       <p className="tag-links">
         <a href={ORACLE_EXPLORER} target="_blank" rel="noreferrer">Oracle explorer</a>
         {uuid && <a href={`${ORACLE_API}/${uuid}`} target="_blank" rel="noreferrer">Attestation {uuid.slice(0, 8)}</a>}
         <button type="button" className="link" onClick={() => openDesk(classId)}>Price desk</button>
-      </p>
+      </p></>}
     </div>
   );
 }
@@ -146,23 +156,40 @@ export function Ticket({ no, rows, status, tone, land, children }: {
   );
 }
 
-/** Small modal/drawer with backdrop, Escape and × close; focus moves into it. */
+/** Native modal makes the background inert; Tab wraps inside and close restores the trigger. */
 export function Drawer({ title, onClose, children, side }: { title: string; onClose: () => void; children: ReactNode; side?: boolean }) {
-  const ref = useRef<HTMLDivElement>(null);
+  const ref = useRef<HTMLDialogElement>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
     const prev = document.activeElement as HTMLElement | null;
-    ref.current?.focus();
-    const k = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    addEventListener("keydown", k);
-    return () => { removeEventListener("keydown", k); prev?.focus?.(); };
-  }, [onClose]);
-  return (
-    <div className={`sheet-bg${side ? " side" : ""}`} onClick={onClose}>
-      <div className="sheet" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} ref={ref} onClick={(e) => e.stopPropagation()}>
+    const dialog = ref.current!;
+    dialog.showModal();
+    dialog.querySelector<HTMLElement>("button")?.focus();
+    const key = (e: KeyboardEvent) => {
+      if (e.key !== "Tab") return;
+      const controls = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex="0"]')]
+        .filter((el) => el.getClientRects().length > 0);
+      const first = controls[0], last = controls[controls.length - 1];
+      if (!first) { e.preventDefault(); dialog.focus(); }
+      else if (e.shiftKey && (document.activeElement === first || document.activeElement === dialog)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    dialog.addEventListener("keydown", key);
+    return () => {
+      dialog.removeEventListener("keydown", key); dialog.close();
+      if (prev?.isConnected) prev.focus();
+      else document.getElementById("main")?.focus();
+    };
+  }, []);
+  return createPortal(
+    <dialog ref={ref} className={`sheet-bg${side ? " side" : ""}`} aria-label={title} aria-modal="true"
+      onCancel={(e) => { e.preventDefault(); close.current(); }} onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="sheet">
         <div className="sheet-head"><h2>{title}</h2><button type="button" className="x" aria-label="Close" onClick={onClose}>×</button></div>
         {children}
       </div>
-    </div>
+    </dialog>, document.body,
   );
 }
 

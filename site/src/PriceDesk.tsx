@@ -5,7 +5,7 @@ import { imdAbi } from "./abi/erc20";
 import { oracleUuid } from "./chain";
 import { age, dateTime, usd } from "./format";
 import { useNow, useWallet, type Protocol } from "./data";
-import { Drawer, TxNote, txLink } from "./ui";
+import { Drawer, PriceTag, TxNote, txLink } from "./ui";
 import { useTx, type Step } from "./tx";
 import { askConnect } from "./Wallet";
 
@@ -38,7 +38,7 @@ export function PriceDesk({ p, focus, onClose }: { p?: Protocol; focus?: Hex; on
         <section className="desk-row" key={c.classId}>
           <h3>{c.template.cardName} <span className="mono">#{c.template.cardNumber}</span></h3>
           <p className="fine">{c.template.setName} · {c.template.gradeColumn} · <a href={`https://www.pricecharting.com/game/${c.template.setSlug}/${c.template.cardSlug}`} target="_blank" rel="noreferrer">PriceCharting</a></p>
-          <p className="mono">{c.last && c.last.issuedAt > 0n ? `${usd(c.last.price)} · ${age(now - Number(c.last.issuedAt))} ago${c.fresh ? "" : " · stale"}` : "No price yet"}</p>
+          <PriceTag price={c.last} stored={c.stored} stale={!c.fresh} now={now} classId={c.classId} />
           {c.pending !== "0x0000000000000000000000000000000000000000000000000000000000000000"
             ? <p className="fine">Request open: <span className="mono">{c.pending.slice(0, 10)}…</span></p>
             : <button type="button" className="secondary" disabled={!!p?.paused.oracle || (!!tx.account && !tx.ready) || !!tx.busy} onClick={() => request(c.classId)}>Request price (0.5 IMD)</button>}
@@ -47,7 +47,7 @@ export function PriceDesk({ p, focus, onClose }: { p?: Protocol; focus?: Hex; on
               {c.history.slice(0, 6).map((e) => (
                 <li key={e.tx + e.kind}>
                   <span>{e.kind === "PriceStored" ? "Price stored" : e.kind === "TimedOut" ? "Timed out" : e.kind}</span>
-                  <span className="mono">{e.stored ? `${usd(e.stored.price)} · ${dateTime(e.stored.issuedAt)}` : e.detail}</span>
+                  {e.stored ? <PriceTag price={e.stored} stored={e.stored} now={now} classId={c.classId} compact /> : <span>{e.detail}</span>}
                   <span>
                     <a href={txLink(e.tx)} target="_blank" rel="noreferrer">Tx</a>
                     {e.stored && <> · <a href={`${ORACLE_API}/${oracleUuid(e.stored.oracleId)}`} target="_blank" rel="noreferrer">Attestation</a></>}

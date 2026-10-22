@@ -2,9 +2,9 @@ import { getAddress, type Abi } from "viem";
 import { ADDR } from "../config";
 import { CardLendingAbi } from "../abi/CardLending";
 import { MockUSDCAbi } from "../abi/MockUSDC";
-import { date, dur, interestFor, pct, usd, usd6 } from "../format";
+import { date, dur, interestFor, pct, usd } from "../format";
 import { useLoans, useNow, useWallet, type Loan, type Protocol } from "../data";
-import { Num, Ticket, TxNote, readSrc, useUi } from "../ui";
+import { Num, Slab, Ticket, TxNote, readSrc, useUi } from "../ui";
 import { useTx, type Step } from "../tx";
 import { askConnect } from "../Wallet";
 
@@ -32,7 +32,7 @@ export function TicketCard({ l, p, now, outcome, actions }: { l: Loan; p: Protoc
         ["Issued", date(l.startedAt)],
         ["Due", `${date(l.maturity)}${l.state === 1 ? (left > 0 ? ` · ${dur(left)} left` : " · past due") : ""}`],
         [l.state === 3 ? (outcome?.kind === "Sold" ? "Sold for" : "Repaid") : "Debt now",
-          l.state === 3 ? usd(outcome?.amount ?? 0n) : <Num key="d" className="tick" src={readSrc("Live debt", `CardLending.debtOf(${l.id})`, ADDR.lending, [["Rule", "principal + ceil(principal × APR × elapsed / (10000 × 365d))"]])}>{usd6(debt)}</Num>],
+          l.state === 3 ? usd(outcome?.amount ?? 0n) : <Num key="d" className="tick" src={readSrc("Live debt", `CardLending.debtOf(${l.id})`, ADDR.lending, [["Rule", "principal + ceil(principal × APR × elapsed / (10000 × 365d))"]])}>{usd(debt)}</Num>],
       ]}>
       {actions}
     </Ticket>
@@ -87,7 +87,9 @@ export function Tickets({ p }: { p?: Protocol }) {
           const newer = !!cls?.fresh && cls.fresh.issuedAt > l.priceIssuedAt;
           const matured = l.state === 1 && BigInt(now) >= l.maturity;
           return (
-            <TicketCard key={l.id.toString()} l={l} p={p!} now={now} outcome={loans.data?.outcome.get(l.id)} actions={
+            <div className="pair" key={l.id.toString()}>
+            <Slab card={l.card} tokenId={l.tokenId} />
+            <TicketCard l={l} p={p!} now={now} outcome={loans.data?.outcome.get(l.id)} actions={
               l.state === 1 || l.state === 2 ? (
                 <>
                   {matured && <p className="warn">Anyone can send this card to auction now.</p>}
@@ -99,6 +101,7 @@ export function Tickets({ p }: { p?: Protocol }) {
                 </>
               ) : undefined
             } />
+            </div>
           );
         })}
       </div>

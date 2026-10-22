@@ -1,9 +1,11 @@
 import { useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import type { Abi } from "viem";
 import { ADDR } from "../config";
 import { CardLendingAbi } from "../abi/CardLending";
 import { MockUSDCAbi } from "../abi/MockUSDC";
-import { auctionPriceAt, dur, parseUsd, usd, usd6 } from "../format";
+import { auctionPriceAt, dur, parseUsd, usd } from "../format";
+import { client } from "../chain";
 import { useLoans, useNow, useWallet, type Loan, type Protocol } from "../data";
 import { Num, Slab, Stamp, TxNote, readSrc } from "../ui";
 import { useTx } from "../tx";
@@ -29,10 +31,17 @@ function Lot({ l, now, p }: { l: Loan; now: number; p: Protocol }) {
   const tx = useTx();
   const w = useWallet(tx.account, p.imd);
   const price = auctionPriceAt(l.auctionDebt, l.auctionStartedAt, BigInt(now));
+  const chainPrice = useQuery({ queryKey: ["auctionPrice", l.id.toString()],
+    queryFn: () => client.readContract({ address: ADDR.lending, abi: CardLendingAbi, functionName: "auctionPrice", args: [l.id] }),
+    refetchInterval: 15_000 });
   const [max, setMax] = useState("");
-  const maxAmt = parseUsd(max) ?? price;
+  const empty = max.trim() === "";
+  const parsed = parseUsd(max);
+  const invalid = !empty && (parsed === undefined || parsed <= 0n);
+  const maxAmt = empty ? chainPrice.data : parsed;
   const toFloor = Number(l.auctionStartedAt) + 86_400 - now;
   const buy = () => {
+    if (invalid || maxAmt === undefined || maxAmt <= 0n) return;
     if (!tx.account) return askConnect();
     const steps = [];
     if ((w.data?.lendAllow ?? 0n) < maxAmt) steps.push({ label: "Approve AUREON", address: ADDR.usdc, abi: MockUSDCAbi as Abi, functionName: "approve", args: [ADDR.lending, maxAmt] });
@@ -46,13 +55,14 @@ function Lot({ l, now, p }: { l: Loan; now: number; p: Protocol }) {
         <dl className="q-rows">
           <div><dt>Ticket</dt><dd className="mono">No. {l.id.toString().padStart(5, "0")}</dd></div>
           <div><dt>Frozen debt</dt><dd><Num src={readSrc("Frozen debt", `CardLending.loan(${l.id}).auctionDebt`, ADDR.lending)}>{usd(l.auctionDebt)}</Num></dd></div>
-          <div><dt>Price now</dt><dd><Num className="tick red" src={readSrc("Auction price", `CardLending.auctionPrice(${l.id})`, ADDR.lending, [["Rule", "debt × (120% − 70% × elapsed/24h), floor 50%"]])}>{usd6(price)}</Num></dd></div>
+          <div><dt>Price now</dt><dd><Num className="tick red" src={readSrc("Auction price", `CardLending.auctionPrice(${l.id})`, ADDR.lending, [["Rule", "debt × (120% − 70% × elapsed/24h), floor 50%"], ["Display", "Per-second estimate; the default maximum uses the latest on-chain quote"]])}>{usd(price)}</Num></dd></div>
           <div><dt>To floor</dt><dd className="mono">{toFloor > 0 ? dur(toFloor) : "At floor"}</dd></div>
         </dl>
         <Curve l={l} now={now} />
-        <label>Max price <input inputMode="decimal" autoComplete="off" name={`max-${l.id}`} value={max} onChange={(e) => setMax(e.target.value)} placeholder={(Number(price) / 1e6).toFixed(2)} /></label>
-        <button type="button" className="primary" disabled={(!!tx.account && !tx.ready) || !!tx.busy} onClick={buy}>Buy for {usd(price)}</button>
-        <p className="fine">The card goes to the connected wallet. The price only falls, so your max covers it.</p>
+        <label>Max price <input inputMode="decimal" autoComplete="off" name={`max-${l.id}`} value={max} onChange={(e) => setMax(e.target.value)} placeholder={chainPrice.data !== undefined ? (Number(chainPrice.data) / 1e6).toFixed(2) : "Reading quote…"} aria-invalid={invalid} aria-describedby={`max-note-${l.id}`} /></label>
+        <p id={`max-note-${l.id}`} className={invalid ? "fine err" : "fine"} role={invalid ? "alert" : undefined}>{invalid ? "Enter a price above zero with at most six decimal places." : `Leave empty to use the latest on-chain price (${usd(chainPrice.data)}). Your entered maximum is always respected.`}</p>
+        <button type="button" className="primary" disabled={invalid || maxAmt === undefined || maxAmt <= 0n || (!!tx.account && !tx.ready) || !!tx.busy} onClick={buy}>Buy for {usd(chainPrice.data)}</button>
+        <p className="fine">The card goes to the connected wallet. Price now is a live estimate; your default max comes from the chain.</p>
         <TxNote tx={tx} />
       </div>
     </article>

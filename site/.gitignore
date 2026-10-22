@@ -1,0 +1,6 @@
+node_modules/
+test-results/
+playwright-report/
+e2e/.state.json
+e2e/.anvil.log
+e2e/.dist/

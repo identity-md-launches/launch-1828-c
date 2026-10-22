@@ -1,0 +1,32 @@
+{
+  "MockUSDC": {
+    "expected": "a89dddd2831b4f1324fb1f67d8fd53b38abdfb237090e89ae8119d5faee93fee",
+    "canonical": "a89dddd2831b4f1324fb1f67d8fd53b38abdfb237090e89ae8119d5faee93fee",
+    "compact": "ea845b07dbfa50d119245094bedee0373bbd583910a43b5ec898720cbca322fd",
+    "match": true
+  },
+  "MockCardNFT": {
+    "expected": "a66f0770185c57372286b47c1924cfdf8e855794b581d3ed14aff0e850949bf9",
+    "canonical": "a66f0770185c57372286b47c1924cfdf8e855794b581d3ed14aff0e850949bf9",
+    "compact": "e88c91483fc3519dd31ea152fad43395598a5de42a24812347bdf73d0ff62524",
+    "match": true
+  },
+  "CardPool": {
+    "expected": "7403958739baee8dd444c796f0d1ed02edda2a048c32bc369abbf1bd83043219",
+    "canonical": "7403958739baee8dd444c796f0d1ed02edda2a048c32bc369abbf1bd83043219",
+    "compact": "a9637ebe47147ad5a0ba0dacc51ae121152bdc1b104cefc26440707974e6f219",
+    "match": true
+  },
+  "CardOracle": {
+    "expected": "f6c64d65c2e3ce128ba2b9fb17e5b5b3653b554a5119c028be7b779f7f738e11",
+    "canonical": "f6c64d65c2e3ce128ba2b9fb17e5b5b3653b554a5119c028be7b779f7f738e11",
+    "compact": "305f10aa7ff5265f116d63d0ae8596a238367b0ad72f6e68e1c1702d7a6baf99",
+    "match": true
+  },
+  "CardLending": {
+    "expected": "67e0f34899d5503ac608c7ac49c5d41796a8da1f5c4439fa2b2066b36b47fbf3",
+    "canonical": "67e0f34899d5503ac608c7ac49c5d41796a8da1f5c4439fa2b2066b36b47fbf3",
+    "compact": "d8b82f952f62a2d12e4a2587c21c74d050e87c5de93afd78f9972047d13c850a",
+    "match": true
+  }
+}
